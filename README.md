@@ -56,6 +56,14 @@ ADMIN_PASSWORD=replace-with-a-strong-global-password
 LEGACY_FALLBACK_ENABLED=true
 ```
 
+Optional hardening knobs for rate limiting:
+
+```env
+RATE_LIMIT_WINDOW_SECONDS=60
+CHAT_RATE_LIMIT_PER_WINDOW=30
+AUTH_RATE_LIMIT_PER_WINDOW=5
+```
+
 Optional for seeding legacy configs into Mongo:
 
 ```env
@@ -145,6 +153,7 @@ SEED_PASSWORDS_FILE=backend/scripts/seed_passwords.json python backend/scripts/s
 - Review and replace `CORS_ORIGINS` before deploy
 - Add real secret values for `MONGO_URL`, `DEEPSEEK_API_KEY` and `ADMIN_PASSWORD` in your provider dashboard
 - Keep `LEGACY_FALLBACK_ENABLED=true` until regression testing is complete
+- Rate limit envs are optional; if you omit them the backend defaults to `60s`, `30` chat requests and `5` auth attempts per window
 
 ### Frontend
 
@@ -158,6 +167,7 @@ SEED_PASSWORDS_FILE=backend/scripts/seed_passwords.json python backend/scripts/s
 - `/crm` is the global/legacy-compatible CRM entry
 - `/crm/:slug` is the tenant-scoped CRM entry
 - `/internal/tenants` uses the global admin password, not tenant passwords
+- Chat and admin auth now return `429` when they exceed the configured rate limit window
 - `passlib==1.7.4` is pinned with `bcrypt==4.0.1` for compatibility; avoid upgrading `bcrypt` to `5.x` without revisiting auth hashing
 
 ## Quick manual smoke test

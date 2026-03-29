@@ -3,6 +3,10 @@
 # - MONGO_URL
 # - DEEPSEEK_API_KEY
 # - ADMIN_PASSWORD
+# Optional rate limit knobs:
+# - RATE_LIMIT_WINDOW_SECONDS
+# - CHAT_RATE_LIMIT_PER_WINDOW
+# - AUTH_RATE_LIMIT_PER_WINDOW
 # Review CORS_ORIGINS for your real frontend origins.
 
 services:
@@ -19,5 +23,11 @@ services:
         value: whasabi_db
       - key: LEGACY_FALLBACK_ENABLED
         value: "true"
+      - key: RATE_LIMIT_WINDOW_SECONDS
+        value: "60"
+      - key: CHAT_RATE_LIMIT_PER_WINDOW
+        value: "30"
+      - key: AUTH_RATE_LIMIT_PER_WINDOW
+        value: "5"
       - key: CORS_ORIGINS
         value: https://your-frontend.example.com,http://localhost:3000
