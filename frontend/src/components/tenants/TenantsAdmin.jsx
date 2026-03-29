@@ -11,6 +11,7 @@ const emptyForm = {
   avatar: "",
   image: "",
   greeting: "",
+  system_prompt: "",
   admin_password: "",
   is_active: true,
 };
@@ -57,6 +58,7 @@ export default function TenantsAdmin() {
   const [loading, setLoading] = useState(false);
   const [submitLoading, setSubmitLoading] = useState(false);
   const [toggleLoading, setToggleLoading] = useState("");
+  const [detailLoading, setDetailLoading] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -104,22 +106,45 @@ export default function TenantsAdmin() {
     setSelectedSlug("");
   };
 
-  const handleSelectTenant = (tenant) => {
-    setSelectedSlug(tenant.slug);
-    setForm({
-      slug: tenant.slug,
-      business_name: tenant.business_name || "",
-      phone: tenant.phone || "",
-      hours: tenant.hours || "",
-      address: tenant.address || "",
-      avatar: tenant.avatar || "",
-      image: tenant.image || "",
-      greeting: tenant.greeting || "",
-      admin_password: "",
-      is_active: tenant.is_active ?? true,
-    });
+  const handleSelectTenant = async (tenant) => {
+    if (!adminPassword.trim()) {
+      setError("Ingresa la contraseña global antes de editar tenants.");
+      return;
+    }
+    setDetailLoading(tenant.slug);
     setMessage("");
     setError("");
+    try {
+      const response = await axios.get(`${API}/internal/tenants/${tenant.slug}`, {
+        headers: authHeaders(),
+      });
+      const detail = response.data;
+      setSelectedSlug(detail.slug);
+      setForm({
+        slug: detail.slug,
+        business_name: detail.business_name || "",
+        phone: detail.phone || "",
+        hours: detail.hours || "",
+        address: detail.address || "",
+        avatar: detail.avatar || "",
+        image: detail.image || "",
+        greeting: detail.greeting || "",
+        system_prompt: detail.system_prompt || "",
+        admin_password: "",
+        is_active: detail.is_active ?? true,
+      });
+    } catch (err) {
+      setError(
+        getRequestErrorMessage(err, {
+          unauthorized: "Contraseña global incorrecta.",
+          notFound: `El tenant ${tenant.slug} ya no existe.`,
+          defaultMessage: "No se pudo cargar el detalle del tenant.",
+        })
+      );
+      console.error("Tenant detail error", err);
+    } finally {
+      setDetailLoading("");
+    }
   };
 
   const handleToggleActive = async (tenant) => {
@@ -178,6 +203,7 @@ export default function TenantsAdmin() {
       avatar: form.avatar.trim(),
       image: form.image.trim(),
       greeting: form.greeting.trim(),
+      system_prompt: form.system_prompt.trim(),
       is_active: form.is_active,
     };
     if (form.admin_password.trim()) {
@@ -287,9 +313,10 @@ export default function TenantsAdmin() {
                   <div className="flex gap-2">
                     <button
                       onClick={() => handleSelectTenant(tenant)}
-                      className="rounded-full border border-white/10 px-3 py-1 text-xs uppercase tracking-wider text-[#22C55E]"
+                      disabled={detailLoading === tenant.slug}
+                      className="rounded-full border border-white/10 px-3 py-1 text-xs uppercase tracking-wider text-[#22C55E] disabled:opacity-40"
                     >
-                      Editar
+                      {detailLoading === tenant.slug ? "Cargando..." : "Editar"}
                     </button>
                     <button
                       onClick={() => handleToggleActive(tenant)}
@@ -403,6 +430,21 @@ export default function TenantsAdmin() {
                   onChange={(event) => handleFormChange("greeting", event.target.value)}
                   className="rounded-2xl border border-white/10 bg-[#050505] px-3 py-2 text-sm focus:outline-none focus:border-[#22C55E]"
                 />
+              </div>
+              <div className="grid gap-2">
+                <label className="text-[11px] uppercase tracking-[0.2em] text-[#9CA3AF]">
+                  System prompt
+                </label>
+                <textarea
+                  rows={6}
+                  value={form.system_prompt}
+                  onChange={(event) => handleFormChange("system_prompt", event.target.value)}
+                  placeholder="Si lo dejas vacio al crear se usa el prompt seguro por defecto."
+                  className="rounded-2xl border border-white/10 bg-[#050505] px-3 py-2 text-sm focus:outline-none focus:border-[#22C55E]"
+                />
+                <p className="text-xs text-[#9CA3AF]">
+                  Controla el comportamiento interno del chatbot. En edicion, dejarlo vacio lo reinicia al prompt seguro por defecto.
+                </p>
               </div>
               <div className="grid gap-2">
                 <label className="text-[11px] uppercase tracking-[0.2em] text-[#9CA3AF]">

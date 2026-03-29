@@ -701,6 +701,12 @@ def tenant_public(doc: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def tenant_internal(doc: Dict[str, Any]) -> Dict[str, Any]:
+    tenant = tenant_public(doc)
+    tenant["system_prompt"] = doc.get("system_prompt") or get_default_system_prompt()
+    return tenant
+
+
 @api_router.get("/health")
 async def health_check(): # Added "service" for consistency with test results
     return {"status": "ok", "service": "whasabi-api"}
@@ -889,7 +895,7 @@ async def create_internal_tenant(
     }
     await db.tenants.insert_one(tenant_doc)
     created = await db.tenants.find_one({"slug": slug})
-    return tenant_public(created)
+    return tenant_internal(created)
 
 
 @api_router.get("/internal/tenants/{slug}")
@@ -899,7 +905,7 @@ async def get_internal_tenant(slug: str, request: Request, x_admin_password: Opt
     tenant_doc = await db.tenants.find_one({"slug": normalized_slug})
     if not tenant_doc:
         raise HTTPException(status_code=404, detail="Tenant no encontrado.")
-    return tenant_public(tenant_doc)
+    return tenant_internal(tenant_doc)
 
 
 @api_router.patch("/internal/tenants/{slug}")
@@ -942,7 +948,7 @@ async def update_internal_tenant(
     update_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.tenants.update_one({"slug": normalized_slug}, {"$set": update_fields})
     updated = await db.tenants.find_one({"slug": normalized_slug})
-    return tenant_public(updated)
+    return tenant_internal(updated)
 
 @api_router.post("/chat")
 async def handle_chat(message: ChatMessage, request: Request):

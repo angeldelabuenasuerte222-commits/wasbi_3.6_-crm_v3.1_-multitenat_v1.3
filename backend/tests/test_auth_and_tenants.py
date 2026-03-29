@@ -94,6 +94,19 @@ class AuthAndTenantsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         created = next(doc for doc in fake_db.tenants.docs if doc["slug"] == "tenant-nuevo")
         self.assertEqual(created["system_prompt"], server.get_default_system_prompt())
+        self.assertEqual(response.json()["system_prompt"], server.get_default_system_prompt())
+
+    def test_internal_tenant_detail_returns_system_prompt_for_authorized_ui(self):
+        tenant = make_tenant("mongo-tenant", password=TENANT_PASSWORD, system_prompt="Prompt interno")
+        client, _, _ = create_client(tenants=[tenant], legacy_enabled=True)
+
+        response = client.get(
+            "/api/internal/tenants/mongo-tenant",
+            headers={"x-admin-password": GLOBAL_PASSWORD},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["system_prompt"], "Prompt interno")
 
     def test_failed_admin_auth_is_rate_limited(self):
         tenant = make_tenant("mongo-tenant", password=TENANT_PASSWORD)
