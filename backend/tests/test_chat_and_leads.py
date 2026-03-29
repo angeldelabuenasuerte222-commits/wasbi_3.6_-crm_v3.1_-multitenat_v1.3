@@ -126,6 +126,23 @@ class ChatAndLeadsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()[0]["slug"], slug)
 
+    def test_chat_is_rate_limited_per_client_and_slug(self):
+        tenant = make_tenant("mongo-tenant", password=TENANT_PASSWORD)
+        client, _, _ = create_client(tenants=[tenant], legacy_enabled=True, chat_limit=1)
+
+        first = client.post(
+            "/api/chat",
+            json={"text": "Hola", "session_id": "rate-limit-session", "slug": "mongo-tenant"},
+        )
+        second = client.post(
+            "/api/chat",
+            json={"text": "Hola otra vez", "session_id": "rate-limit-session", "slug": "mongo-tenant"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(second.headers.get("Retry-After"), "60")
+
 
 if __name__ == "__main__":
     unittest.main()

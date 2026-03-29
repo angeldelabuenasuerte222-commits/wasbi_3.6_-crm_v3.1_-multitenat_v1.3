@@ -190,7 +190,15 @@ def make_lead(
     }
 
 
-def create_client(*, tenants=None, leads=None, legacy_enabled=True, deepseek_reply="Respuesta IA"):
+def create_client(
+    *,
+    tenants=None,
+    leads=None,
+    legacy_enabled=True,
+    deepseek_reply="Respuesta IA",
+    chat_limit=None,
+    auth_limit=None,
+):
     fake_db = SimpleNamespace(
         tenants=FakeCollection(tenants),
         leads=FakeCollection(leads),
@@ -202,7 +210,10 @@ def create_client(*, tenants=None, leads=None, legacy_enabled=True, deepseek_rep
 
     server.db = fake_db
     server.chat_sessions.clear()
+    server.rate_limit_events.clear()
     server.LEGACY_FALLBACK_ENABLED = legacy_enabled
+    server.CHAT_RATE_LIMIT_PER_WINDOW = chat_limit or 30
+    server.AUTH_RATE_LIMIT_PER_WINDOW = auth_limit or 5
     server.ensure_mongo_indexes = _noop_indexes
     server.httpx.AsyncClient = lambda: FakeAsyncClient(deepseek_reply)
 

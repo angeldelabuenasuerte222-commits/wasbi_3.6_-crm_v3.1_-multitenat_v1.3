@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from enum import Enum
 from datetime import datetime, timezone
 import sys # Import sys for SystemExit
@@ -79,7 +80,26 @@ def _parse_bool_env_flag(key: str, default: bool) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _parse_int_env_flag(key: str, default: int) -> int:
+    raw_value = os.environ.get(key)
+    if raw_value is None:
+        return default
+    try:
+        parsed_value = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r. Using default=%d", key, raw_value, default)
+        return default
+    if parsed_value <= 0:
+        logger.warning("Non-positive integer for %s=%r. Using default=%d", key, raw_value, default)
+        return default
+    return parsed_value
+
+
 LEGACY_FALLBACK_ENABLED = _parse_bool_env_flag("LEGACY_FALLBACK_ENABLED", True)
+RATE_LIMIT_WINDOW_SECONDS = _parse_int_env_flag("RATE_LIMIT_WINDOW_SECONDS", 60)
+CHAT_RATE_LIMIT_PER_WINDOW = _parse_int_env_flag("CHAT_RATE_LIMIT_PER_WINDOW", 30)
+AUTH_RATE_LIMIT_PER_WINDOW = _parse_int_env_flag("AUTH_RATE_LIMIT_PER_WINDOW", 5)
+rate_limit_events: Dict[str, list[float]] = {}
 
 
 def _log_migration_event(
@@ -128,8 +148,89 @@ def _is_tenant_active(tenant: Dict[str, Any]) -> bool:
     return tenant.get("is_active", True)
 
 
-async def verify_tenant_admin_password(slug: Optional[str], provided_password: Optional[str]) -> None:
+def _get_request_ip(request: Optional[Request]) -> str:
+    if request is None:
+        return "unknown"
+
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        first_hop = forwarded_for.split(",")[0].strip()
+        if first_hop:
+            return first_hop
+
+    client_host = getattr(request.client, "host", None)
+    return client_host or "unknown"
+
+
+def _prune_rate_limit_bucket(bucket_key: str, now: Optional[float] = None) -> list[float]:
+    current_time = now if now is not None else time.monotonic()
+    window_start = current_time - RATE_LIMIT_WINDOW_SECONDS
+    recent_events = [event_ts for event_ts in rate_limit_events.get(bucket_key, []) if event_ts > window_start]
+    if recent_events:
+        rate_limit_events[bucket_key] = recent_events
+    else:
+        rate_limit_events.pop(bucket_key, None)
+    return recent_events
+
+
+def _raise_rate_limit(detail: str, retry_after_seconds: int) -> None:
+    raise HTTPException(
+        status_code=429,
+        detail=detail,
+        headers={"Retry-After": str(max(retry_after_seconds, 1))},
+    )
+
+
+def _ensure_rate_limit(bucket_key: str, limit: int, detail: str) -> None:
+    recent_events = _prune_rate_limit_bucket(bucket_key)
+    if len(recent_events) < limit:
+        return
+
+    oldest_relevant_event = recent_events[0]
+    elapsed = time.monotonic() - oldest_relevant_event
+    retry_after_seconds = int(RATE_LIMIT_WINDOW_SECONDS - elapsed) + 1
+    _raise_rate_limit(detail, retry_after_seconds)
+
+
+def _record_rate_limit_event(bucket_key: str) -> None:
+    recent_events = _prune_rate_limit_bucket(bucket_key)
+    recent_events.append(time.monotonic())
+    rate_limit_events[bucket_key] = recent_events
+
+
+def _clear_rate_limit_bucket(bucket_key: str) -> None:
+    rate_limit_events.pop(bucket_key, None)
+
+
+def _auth_rate_limit_key(slug: Optional[str], request: Optional[Request], scope: str) -> str:
+    normalized_slug = normalize_slug(slug) if slug else "-"
+    return f"auth:{scope}:{normalized_slug}:{_get_request_ip(request)}"
+
+
+def _enforce_auth_rate_limit(slug: Optional[str], request: Optional[Request], scope: str) -> str:
+    bucket_key = _auth_rate_limit_key(slug, request, scope)
+    _ensure_rate_limit(
+        bucket_key,
+        AUTH_RATE_LIMIT_PER_WINDOW,
+        "Demasiados intentos de autenticación. Intenta de nuevo en un momento.",
+    )
+    return bucket_key
+
+
+def _chat_rate_limit_key(slug: Optional[str], request: Optional[Request]) -> str:
+    normalized_slug = normalize_slug(slug) if slug else DEFAULT_SLUG
+    return f"chat:{normalized_slug}:{_get_request_ip(request)}"
+
+
+async def verify_tenant_admin_password(
+    slug: Optional[str],
+    provided_password: Optional[str],
+    request: Optional[Request] = None,
+) -> None:
+    auth_bucket_key = _enforce_auth_rate_limit(slug, request, "tenant")
+
     if not provided_password:
+        _record_rate_limit_event(auth_bucket_key)
         _log_migration_event(
             "tenant_admin_auth",
             slug,
@@ -143,6 +244,7 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
         tenant = await get_tenant_by_slug(slug)
         if tenant:
             if not _is_tenant_active(tenant):
+                _record_rate_limit_event(auth_bucket_key)
                 _log_migration_event(
                     "tenant_admin_auth",
                     slug,
@@ -156,6 +258,7 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
             password_hash = admin_config.get("password_hash")
             if password_hash:
                 if crypt_context.verify(provided_password, password_hash):
+                    _clear_rate_limit_bucket(auth_bucket_key)
                     _log_migration_event(
                         "tenant_admin_auth",
                         slug,
@@ -164,6 +267,7 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
                         result="success"
                     )
                     return
+                _record_rate_limit_event(auth_bucket_key)
                 _log_migration_event(
                     "tenant_admin_auth",
                     slug,
@@ -192,6 +296,7 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
     fallback_requested = _matches_global_admin_password(provided_password)
     if fallback_requested:
         if LEGACY_FALLBACK_ENABLED:
+            _clear_rate_limit_bucket(auth_bucket_key)
             _log_migration_event(
                 "tenant_admin_auth",
                 slug,
@@ -200,6 +305,7 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
                 result="success"
             )
             return
+        _record_rate_limit_event(auth_bucket_key)
         _log_migration_event(
             "tenant_admin_auth",
             slug,
@@ -210,6 +316,7 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
         )
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    _record_rate_limit_event(auth_bucket_key)
     _log_migration_event(
         "tenant_admin_auth",
         slug,
@@ -223,13 +330,20 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
 
 async def verify_admin_password(
     slug: Optional[str],
-    x_admin_password: Optional[str]
+    x_admin_password: Optional[str],
+    request: Optional[Request] = None,
 ) -> None:
-    await verify_tenant_admin_password(slug, x_admin_password)
+    await verify_tenant_admin_password(slug, x_admin_password, request=request)
 
 
-async def verify_internal_admin_password(provided_password: Optional[str]) -> None:
+async def verify_internal_admin_password(
+    provided_password: Optional[str],
+    request: Optional[Request] = None,
+) -> None:
+    auth_bucket_key = _enforce_auth_rate_limit(None, request, "internal")
+
     if not provided_password:
+        _record_rate_limit_event(auth_bucket_key)
         _log_migration_event(
             "internal_admin_auth",
             None,
@@ -239,6 +353,7 @@ async def verify_internal_admin_password(provided_password: Optional[str]) -> No
         raise HTTPException(status_code=401, detail="Cabecera x-admin-password requerida.")
 
     if _matches_global_admin_password(provided_password):
+        _clear_rate_limit_bucket(auth_bucket_key)
         _log_migration_event(
             "internal_admin_auth",
             None,
@@ -247,6 +362,7 @@ async def verify_internal_admin_password(provided_password: Optional[str]) -> No
         )
         return
 
+    _record_rate_limit_event(auth_bucket_key)
     _log_migration_event(
         "internal_admin_auth",
         None,
@@ -257,8 +373,8 @@ async def verify_internal_admin_password(provided_password: Optional[str]) -> No
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-async def ensure_internal_admin(x_admin_password: Optional[str]) -> None:
-    await verify_internal_admin_password(x_admin_password)
+async def ensure_internal_admin(x_admin_password: Optional[str], request: Optional[Request] = None) -> None:
+    await verify_internal_admin_password(x_admin_password, request=request)
 
 # MongoDB connection
 client = AsyncIOMotorClient(MONGO_URL)
@@ -598,7 +714,7 @@ async def get_leads(
     normalized_identifier = normalize_slug(identifier)
     tenant = await get_tenant_by_slug(normalized_identifier)
     if tenant or normalized_identifier in CLIENT_CONFIGS:
-        await verify_admin_password(normalized_identifier, x_admin_password)
+        await verify_admin_password(normalized_identifier, x_admin_password, request=request)
         leads = await db.leads.find({"slug": normalized_identifier}, {"_id": 0}).sort("created_at", -1).to_list(1000)
         return leads
 
@@ -607,16 +723,17 @@ async def get_leads(
         lead_doc = await db.leads.find_one({"_id": ObjectId(identifier)})
         if not lead_doc:
             raise HTTPException(status_code=404, detail="Lead no encontrado")
-        await verify_admin_password(lead_doc.get("slug"), x_admin_password)
+        await verify_admin_password(lead_doc.get("slug"), x_admin_password, request=request)
         return serialize_lead(lead_doc)
 
-    await verify_admin_password(normalized_identifier, x_admin_password)
+    await verify_admin_password(normalized_identifier, x_admin_password, request=request)
     leads = await db.leads.find({"slug": normalized_identifier}, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return leads
 
 
 @api_router.get("/leads")
 async def list_leads(
+    request: Request,
     q: Optional[str] = None,
     status: Optional[LeadStatus] = None,
     slug: Optional[str] = None,
@@ -624,7 +741,7 @@ async def list_leads(
     x_admin_password: Optional[str] = Header(None)
 ):
     normalized_slug = normalize_slug(slug) if slug else None
-    await verify_admin_password(normalized_slug, x_admin_password)
+    await verify_admin_password(normalized_slug, x_admin_password, request=request)
     filters: Dict[str, Any] = {}
     if normalized_slug:
         filters["slug"] = normalized_slug
@@ -655,6 +772,7 @@ async def list_leads(
 async def update_lead(
     lead_id: str,
     payload: LeadUpdate,
+    request: Request,
     x_admin_password: Optional[str] = Header(None)
 ):
     try:
@@ -666,7 +784,7 @@ async def update_lead(
     if not lead_doc:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
 
-    await verify_admin_password(lead_doc.get("slug"), x_admin_password)
+    await verify_admin_password(lead_doc.get("slug"), x_admin_password, request=request)
 
     update_fields: Dict[str, Any] = {}
     if payload.status is not None:
@@ -687,8 +805,8 @@ async def update_lead(
 
 
 @api_router.get("/internal/tenants")
-async def list_internal_tenants(x_admin_password: Optional[str] = Header(None)):
-    await ensure_internal_admin(x_admin_password)
+async def list_internal_tenants(request: Request, x_admin_password: Optional[str] = Header(None)):
+    await ensure_internal_admin(x_admin_password, request=request)
     cursor = db.tenants.find().sort("created_at", -1)
     docs = await cursor.to_list(length=500)
     return [tenant_public(doc) for doc in docs]
@@ -697,9 +815,10 @@ async def list_internal_tenants(x_admin_password: Optional[str] = Header(None)):
 @api_router.post("/internal/tenants")
 async def create_internal_tenant(
     payload: TenantCreate,
+    request: Request,
     x_admin_password: Optional[str] = Header(None)
 ):
-    await ensure_internal_admin(x_admin_password)
+    await ensure_internal_admin(x_admin_password, request=request)
     slug = ensure_valid_slug(payload.slug)
     if await db.tenants.find_one({"slug": slug}):
         raise HTTPException(status_code=400, detail="El slug ya existe.")
@@ -725,8 +844,8 @@ async def create_internal_tenant(
 
 
 @api_router.get("/internal/tenants/{slug}")
-async def get_internal_tenant(slug: str, x_admin_password: Optional[str] = Header(None)):
-    await ensure_internal_admin(x_admin_password)
+async def get_internal_tenant(slug: str, request: Request, x_admin_password: Optional[str] = Header(None)):
+    await ensure_internal_admin(x_admin_password, request=request)
     normalized_slug = ensure_valid_slug(slug)
     tenant_doc = await db.tenants.find_one({"slug": normalized_slug})
     if not tenant_doc:
@@ -738,9 +857,10 @@ async def get_internal_tenant(slug: str, x_admin_password: Optional[str] = Heade
 async def update_internal_tenant(
     slug: str,
     payload: TenantUpdate,
+    request: Request,
     x_admin_password: Optional[str] = Header(None)
 ):
-    await ensure_internal_admin(x_admin_password)
+    await ensure_internal_admin(x_admin_password, request=request)
     normalized_slug = ensure_valid_slug(slug)
     existing = await db.tenants.find_one({"slug": normalized_slug})
     if not existing:
@@ -776,10 +896,17 @@ async def update_internal_tenant(
     return tenant_public(updated)
 
 @api_router.post("/chat")
-async def handle_chat(message: ChatMessage):
+async def handle_chat(message: ChatMessage, request: Request):
     session_id = message.session_id
     text = message.text.strip()
     lower_text = text.lower()
+    chat_bucket_key = _chat_rate_limit_key(message.slug, request)
+    _ensure_rate_limit(
+        chat_bucket_key,
+        CHAT_RATE_LIMIT_PER_WINDOW,
+        "Demasiados mensajes en poco tiempo. Intenta de nuevo en un momento.",
+    )
+    _record_rate_limit_event(chat_bucket_key)
 
     # ESTRATEGIA DE MIGRACIÓN: Primero Mongo, luego fallback a legacy
     config, resolved_slug, resolved_tenant_id, config_source = await _resolve_chat_config(message.slug)

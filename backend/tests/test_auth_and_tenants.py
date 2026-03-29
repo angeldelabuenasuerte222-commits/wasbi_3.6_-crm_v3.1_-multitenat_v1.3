@@ -95,6 +95,25 @@ class AuthAndTenantsTests(unittest.TestCase):
         created = next(doc for doc in fake_db.tenants.docs if doc["slug"] == "tenant-nuevo")
         self.assertEqual(created["system_prompt"], server.get_default_system_prompt())
 
+    def test_failed_admin_auth_is_rate_limited(self):
+        tenant = make_tenant("mongo-tenant", password=TENANT_PASSWORD)
+        client, _, _ = create_client(tenants=[tenant], legacy_enabled=True, auth_limit=1)
+
+        first = client.get(
+            "/api/leads",
+            params={"slug": "mongo-tenant"},
+            headers={"x-admin-password": "wrong-password"},
+        )
+        second = client.get(
+            "/api/leads",
+            params={"slug": "mongo-tenant"},
+            headers={"x-admin-password": "wrong-password"},
+        )
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(second.headers.get("Retry-After"), "60")
+
 
 if __name__ == "__main__":
     unittest.main()
