@@ -65,6 +65,36 @@ crypt_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 SLUG_PATTERN = re.compile(r"^[a-z0-9-]+$")
 
 
+def _parse_bool_env_flag(key: str, default: bool) -> bool:
+    raw_value = os.environ.get(key)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+LEGACY_FALLBACK_ENABLED = _parse_bool_env_flag("LEGACY_FALLBACK_ENABLED", True)
+
+
+def _log_migration_event(
+    endpoint: str,
+    slug: Optional[str],
+    source: str,
+    legacy_auth: Optional[bool] = None,
+    **extra_fields: Any
+) -> None:
+    slug_tag = _format_slug_for_log(slug)
+    components = [
+        f"endpoint={endpoint}",
+        f"slug={slug_tag}",
+        f"source={source}"
+    ]
+    if legacy_auth is not None:
+        components.append(f"legacy_auth={'true' if legacy_auth else 'false'}")
+    for key, value in extra_fields.items():
+        components.append(f"{key}={value}")
+    logger.info(" ".join(components))
+
+
 def normalize_slug(value: str) -> str:
     return value.strip().lower()
 
@@ -79,11 +109,13 @@ def _format_slug_for_log(slug: Optional[str]) -> str:
     return slug if slug else "None"
 
 async def verify_tenant_admin_password(slug: Optional[str], provided_password: Optional[str]) -> None:
-    slug_tag = _format_slug_for_log(slug)
     if not provided_password:
-        logger.info(
-            "tenant admin auth slug=%s source=LEGACY_GLOBAL result=FAILURE missing password",
-            slug_tag
+        _log_migration_event(
+            "tenant_admin_auth",
+            slug,
+            "LEGACY_GLOBAL",
+            legacy_auth=False,
+            reason="missing_password"
         )
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -94,36 +126,67 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
             password_hash = admin_config.get("password_hash")
             if password_hash:
                 if crypt_context.verify(provided_password, password_hash):
-                    logger.info(
-                        "tenant admin auth slug=%s source=MONGO result=SUCCESS",
-                        slug_tag
+                    _log_migration_event(
+                        "tenant_admin_auth",
+                        slug,
+                        "MONGO",
+                        legacy_auth=False,
+                        result="success"
                     )
                     return
-                logger.info(
-                    "tenant admin auth slug=%s source=MONGO result=FAILURE invalid password",
-                    slug_tag
+                _log_migration_event(
+                    "tenant_admin_auth",
+                    slug,
+                    "MONGO",
+                    legacy_auth=False,
+                    result="failure",
+                    reason="invalid_password"
                 )
                 raise HTTPException(status_code=401, detail="Unauthorized")
-            logger.info(
-                "tenant admin auth slug=%s source=NOT_FOUND result=FAILURE missing admin_config",
-                slug_tag
+            _log_migration_event(
+                "tenant_admin_auth",
+                slug,
+                "NOT_FOUND",
+                legacy_auth=False,
+                reason="missing_admin_config"
             )
         else:
-            logger.info(
-                "tenant admin auth slug=%s source=NOT_FOUND result=FAILURE missing tenant",
-                slug_tag
+            _log_migration_event(
+                "tenant_admin_auth",
+                slug,
+                "NOT_FOUND",
+                legacy_auth=False,
+                reason="missing_tenant"
             )
 
-    if provided_password == ADMIN_PASSWORD:
-        logger.info(
-            "tenant admin auth slug=%s source=LEGACY_GLOBAL result=SUCCESS",
-            slug_tag
+    fallback_requested = provided_password == ADMIN_PASSWORD
+    if fallback_requested:
+        if LEGACY_FALLBACK_ENABLED:
+            _log_migration_event(
+                "tenant_admin_auth",
+                slug,
+                "LEGACY_GLOBAL",
+                legacy_auth=True,
+                result="success"
+            )
+            return
+        _log_migration_event(
+            "tenant_admin_auth",
+            slug,
+            "LEGACY_GLOBAL",
+            legacy_auth=True,
+            result="failure",
+            fallback_disabled="true"
         )
-        return
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    logger.info(
-        "tenant admin auth slug=%s source=LEGACY_GLOBAL result=FAILURE invalid global password",
-        slug_tag
+    _log_migration_event(
+        "tenant_admin_auth",
+        slug,
+        "LEGACY_GLOBAL",
+        legacy_auth=False,
+        result="failure",
+        reason="invalid_global_password"
     )
     raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -257,6 +320,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 chat_sessions: Dict[str, Dict[str, Any]] = {}
 
 # Multi-client mock configuration
+# Legacy placeholder configs (temporary compat layer, remove once Mongo has every tenant).
 CLIENT_CONFIGS = {
     "cafe-minima": {
         "business_name": "Café Mínima",
@@ -306,24 +370,35 @@ async def _resolve_chat_config(raw_slug: Optional[str]) -> Tuple[Dict[str, Any],
         tenant = await get_tenant_by_slug(slug)
         if tenant:
             config = _build_chat_config_from_tenant(tenant)
-            logger.info("Chat config: slug=%s source=MONGO", slug)
+            _log_migration_event("chat_config", slug, "MONGO")
             return config, slug, tenant["id"], "MONGO"
 
         if slug in DEMO_SLUGS:
-            logger.info("Chat config: slug=%s source=DEFAULT_ONLY_WHEN_ALLOWED", slug)
+            _log_migration_event("chat_config", slug, "DEFAULT_ONLY_WHEN_ALLOWED")
             default_config = dict(CLIENT_CONFIGS[DEFAULT_SLUG])
             default_config["_source"] = "default_only_when_allowed"
             return default_config, DEFAULT_SLUG, None, "DEFAULT_ONLY_WHEN_ALLOWED"
 
         legacy_config = CLIENT_CONFIGS.get(slug)
         if legacy_config:
-            logger.info("Chat config: slug=%s source=LEGACY_FALLBACK", slug)
+            if not LEGACY_FALLBACK_ENABLED:
+                _log_migration_event(
+                    "chat_config",
+                    slug,
+                    "LEGACY_FALLBACK",
+                    fallback_disabled="true"
+                )
+                raise HTTPException(
+                    status_code=404,
+                    detail="Legacy chat configuration is temporarily disabled."
+                )
+            _log_migration_event("chat_config", slug, "LEGACY_FALLBACK")
             return {**legacy_config, "_source": "legacy_fallback"}, slug, None, "LEGACY_FALLBACK"
 
-        logger.info("Chat config: slug=%s source=NOT_FOUND", slug)
+        _log_migration_event("chat_config", slug, "NOT_FOUND", reason="missing_config")
         raise HTTPException(status_code=404, detail="Configuración de chat no encontrada para el slug solicitado.")
 
-    logger.info("Chat config: slug=%s source=DEFAULT_ONLY_WHEN_ALLOWED", "<empty>")
+    _log_migration_event("chat_config", "<empty>", "DEFAULT_ONLY_WHEN_ALLOWED")
     default_config = dict(CLIENT_CONFIGS[DEFAULT_SLUG])
     default_config["_source"] = "default_only_when_allowed"
     return default_config, DEFAULT_SLUG, None, "DEFAULT_ONLY_WHEN_ALLOWED"
@@ -438,16 +513,27 @@ async def get_business(slug: str):
     tenant = await get_tenant_by_slug(slug)
     if tenant:
         config = build_public_business_config(tenant)
-        logger.info("Business config: slug=%s source=MONGO", slug)
+        _log_migration_event("get_business", slug, "MONGO")
         return config
     
     # --- INTENTO 2: Fallback a CLIENT_CONFIGS (LEGACY - TEMPORAL) ---
     legacy_config = CLIENT_CONFIGS.get(slug)
     if legacy_config:
-        logger.info("Business config: slug=%s source=LEGACY_FALLBACK", slug)
+        if not LEGACY_FALLBACK_ENABLED:
+            _log_migration_event(
+                "get_business",
+                slug,
+                "LEGACY_FALLBACK",
+                fallback_disabled="true"
+            )
+            raise HTTPException(
+                status_code=404,
+                detail="Legacy business configuration is temporarily disabled."
+            )
+        _log_migration_event("get_business", slug, "LEGACY_FALLBACK")
         return {**legacy_config, "_source": "legacy_fallback"}
 
-    logger.info("Business config: slug=%s source=NOT_FOUND", slug)
+    _log_migration_event("get_business", slug, "NOT_FOUND", reason="missing_config")
     raise HTTPException(status_code=404, detail="Configuración no encontrada para ese negocio")
 
 @api_router.get("/leads/{identifier}")
