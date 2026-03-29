@@ -1,10 +1,14 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import "@/App.css";
 import axios from "axios";
 import { ArrowUp, MapPin, Clock, MoreVertical, Phone, CheckCheck } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { BrowserRouter, Routes, Route, useParams } from "react-router-dom";
 import { API } from "@/lib/api";
+import { normalizeSlug } from "@/lib/slug";
+import AdminDashboard from "./AdminDashboard";
+import CRMPage from "@/components/crm/CRMPage";
+import TenantsAdmin from "@/components/tenants/TenantsAdmin";
 
 function InfoCard({ business }) {
   if (!business) return null;
@@ -32,22 +36,73 @@ function InfoCard({ business }) {
   );
 }
 
+function LoadStateCard({ title, description, actionLabel, onAction }) {
+  return (
+    <div className="min-h-screen bg-[#050505] flex items-center justify-center p-6 text-white">
+      <div className="w-full max-w-md rounded-3xl border border-white/10 bg-[#0A0A0A] p-6 text-center shadow-2xl">
+        <h2 className="text-2xl font-semibold">{title}</h2>
+        <p className="mt-3 text-sm leading-relaxed text-[#9CA3AF]">{description}</p>
+        {actionLabel && onAction && (
+          <button
+            onClick={onAction}
+            className="mt-5 rounded-2xl bg-[#22C55E] px-4 py-2 text-sm font-semibold text-black transition hover:bg-[#16A34A]"
+          >
+            {actionLabel}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function resolveBusinessError(error, slug) {
+  if (axios.isAxiosError(error)) {
+    if (error.response?.status === 404) {
+      return {
+        title: "Negocio no disponible",
+        description: `No encontramos una configuracion activa para "${slug}". Revisa el slug o confirma que el tenant siga habilitado.`,
+      };
+    }
+    if (!error.response) {
+      return {
+        title: "Sin conexion con el backend",
+        description: "No fue posible cargar el negocio porque el backend no respondio. Revisa el deploy o tu entorno local.",
+      };
+    }
+  }
+
+  return {
+    title: "Error cargando el negocio",
+    description: "No fue posible cargar la configuracion del negocio. Intenta de nuevo en unos segundos.",
+  };
+}
+
 function ChatInterface() {
   const { slug } = useParams();
-  const currentSlug = slug || "default";
+  const currentSlug = normalizeSlug(slug) || "default";
 
   const [business, setBusiness] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
+  const [isBusinessLoading, setIsBusinessLoading] = useState(true);
+  const [businessError, setBusinessError] = useState(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [sessionId] = useState(`session_${Date.now()}_${Math.random().toString(36).substring(7)}`);
   
   const chatEndRef = useRef(null);
 
   useEffect(() => {
-    // Fetch business details
+    let cancelled = false;
+    setBusiness(null);
+    setMessages([]);
+    setIsTyping(false);
+    setIsBusinessLoading(true);
+    setBusinessError(null);
+
     axios.get(`${API}/business/${currentSlug}`)
       .then(res => {
+        if (cancelled) return;
         setBusiness(res.data);
         setMessages([
           {
@@ -64,9 +119,19 @@ function ChatInterface() {
         ]);
       })
       .catch(err => {
+        if (cancelled) return;
+        setBusinessError(resolveBusinessError(err, currentSlug));
         console.error("Error fetching business config", err);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setIsBusinessLoading(false);
       });
-  }, [currentSlug]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentSlug, reloadKey]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -97,15 +162,42 @@ function ChatInterface() {
     } catch (error) {
       setMessages(prev => [
         ...prev,
-        { id: uniqueId(), sender: "ai", text: "Lo siento, hubo un problema técnico." }
+        {
+          id: uniqueId(),
+          sender: "ai",
+          text: axios.isAxiosError(error) && error.response?.status === 404
+            ? "Este negocio ya no esta disponible o el slug no existe."
+            : !axios.isAxiosError(error) || error.response
+              ? "Lo siento, hubo un problema tecnico."
+              : "No pude conectar con el servidor en este momento.",
+        }
       ]);
     } finally {
       setIsTyping(false);
     }
   };
 
+  if (isBusinessLoading) {
+    return (
+      <div className="min-h-screen bg-[#050505] flex items-center justify-center text-white">
+        Cargando negocio...
+      </div>
+    );
+  }
+
+  if (businessError) {
+    return (
+      <LoadStateCard
+        title={businessError.title}
+        description={businessError.description}
+        actionLabel="Reintentar"
+        onAction={() => setReloadKey((prev) => prev + 1)}
+      />
+    );
+  }
+
   if (!business) {
-    return <div className="min-h-screen bg-[#050505] flex items-center justify-center text-white">Cargando...</div>;
+    return <LoadStateCard title="Negocio no disponible" description="No hay configuracion publica para esta ruta." />;
   }
 
   return (
@@ -204,10 +296,6 @@ function ChatInterface() {
     </div>
   );
 }
-
-import AdminDashboard from "./AdminDashboard";
-import CRMPage from "@/components/crm/CRMPage";
-import TenantsAdmin from "@/components/tenants/TenantsAdmin";
 
 export default function App() {
   return (

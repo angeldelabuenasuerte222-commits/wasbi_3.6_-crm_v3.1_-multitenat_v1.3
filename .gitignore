@@ -57,6 +57,8 @@ chainlit.md
 .chainlit
 .ipynb_checkpoints/
 .ac
+.deps-backend/
+.emergent/
 
 # Deployment
 .vercel
@@ -76,7 +78,12 @@ agenthub/agents/youtube/db
 # Build caches
 .cache/
 
+.gitconfig
+test_reports/*.json
+test_result.md
+
 memory/test_credentials.md
+backend_test_results.json
 
 # Mobile development
 android-sdk/-e 

@@ -1,93 +1,169 @@
-# WHASABI - AI Receptionist Landing Page Chat
+# WHASABI
 
-WHASABI is a minimal AI-powered landing page chat system for small businesses in Mexico. It allows visitors to chat with an AI assistant that acts like a receptionist, answers questions, and automatically captures leads (name, phone, intent).
+Fullstack multi-tenant project with:
 
-## Tech Stack
-- **Frontend**: React, TailwindCSS, Framer Motion
-- **Backend**: FastAPI (Python)
-- **Database**: MongoDB (Motor)
-- **AI Provider**: DeepSeek API
+- FastAPI + MongoDB backend
+- React frontend
+- Public chatbot per business slug
+- CRM with tenant login and legacy/global mode
+- Internal tenant admin panel
 
-## Project Structure
-- `/backend`: FastAPI backend
-- `/frontend`: React frontend
+## Current scope
 
----
+- Public business route: `/:slug`
+- Public API: `/api/business/{slug}`, `/api/chat`
+- CRM global/legacy: `/crm`
+- CRM by tenant slug: `/crm/:slug`
+- Internal tenant panel: `/internal/tenants`
 
-## 🚀 Environment Variables
+Legacy fallback is still available and is controlled by `LEGACY_FALLBACK_ENABLED`.
 
-Create a `.env` file in the **`/backend`** folder:
+## What belongs where
+
+### GitHub
+
+- Source code
+- Pull requests
+- CI/CD wiring if you add it later
+- No runtime secrets should live here
+
+### Backend deploy
+
+- Runs the FastAPI app from `backend/`
+- Needs MongoDB connectivity
+- Needs DeepSeek API access
+- Owns backend env vars such as `MONGO_URL`, `DEEPSEEK_API_KEY`, `ADMIN_PASSWORD`, `CORS_ORIGINS`
+
+### Frontend deploy
+
+- Serves the React SPA from `frontend/`
+- Only needs to know the backend base URL through `REACT_APP_BACKEND_URL`
+- Must point to the backend origin already exposing `/api`
+
+## Required environment variables
+
+### Backend (`backend/.env`)
+
+Required:
+
 ```env
 MONGO_URL=mongodb+srv://<user>:<password>@cluster.mongodb.net/
 DB_NAME=whasabi_db
 DEEPSEEK_API_KEY=sk-...
-CORS_ORIGINS=https://your-frontend.netlify.app,http://localhost:3000
+CORS_ORIGINS=http://localhost:3000,https://your-frontend.example.com
 PORT=8001
+ADMIN_PASSWORD=replace-with-a-strong-global-password
+LEGACY_FALLBACK_ENABLED=true
 ```
 
-Create a `.env` file in the **`/frontend`** folder:
+Optional for seeding legacy configs into Mongo:
+
 ```env
-REACT_APP_BACKEND_URL=https://your-backend.onrender.com
+SEED_PASSWORD_CAFE_MINIMA=replace-me
+SEED_PASSWORD_DENTISTA_LOPEZ=replace-me
+# or:
+SEED_PASSWORDS_FILE=backend/scripts/seed_passwords.json
 ```
 
----
+Reference file: `backend/.env.example`
 
-## 🛠️ Local Development
+### Frontend (`frontend/.env`)
 
-### 1. Backend
+```env
+REACT_APP_BACKEND_URL=http://localhost:8001
+```
+
+Reference file: `frontend/.env.example`
+
+## Local development
+
+### Backend
+
 ```bash
 cd backend
-python -m venv venv
-source venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-python server.py
-# Or run with uvicorn: uvicorn server:app --host 0.0.0.0 --port 8001 --reload
+uvicorn server:app --host 0.0.0.0 --port 8001 --reload
 ```
 
-### 2. Frontend
+Windows PowerShell:
+
+```powershell
+cd backend
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+py -m pip install -r requirements.txt
+py -m uvicorn server:app --host 0.0.0.0 --port 8001 --reload
+```
+
+### Frontend
+
 ```bash
 cd frontend
-yarn install
-yarn start
+npm ci
+npm start
 ```
 
----
+Production build:
 
-## 🌐 Production Deployment Guide
+```bash
+cd frontend
+npm run build
+```
 
-The application is structured to be easily deployed on **Netlify** (Frontend) and **Render** (Backend).
+## Seed legacy tenants into Mongo
 
-### Deploy Backend to Render
+The seed script no longer imports the full backend runtime. It only needs Mongo access plus passwords for the slugs you want to migrate.
 
-1. Go to [Render](https://render.com) and create a new **Web Service**.
-2. Connect your GitHub repository.
-3. Set the **Root Directory** to `backend`.
-4. Environment: `Python`
-5. Build Command: `pip install -r requirements.txt`
-6. Start Command: `uvicorn server:app --host 0.0.0.0 --port $PORT`
-7. Add the required Environment Variables listed above (make sure `CORS_ORIGINS` includes your future Netlify URL).
-8. Deploy!
+Example with env vars:
 
-### Database: Connect MongoDB Atlas
-1. Create a free cluster on [MongoDB Atlas](https://www.mongodb.com/cloud/atlas).
-2. Get your connection string (URI).
-3. Add the `MONGO_URL` and `DB_NAME` to your Render environment variables.
+```bash
+SEED_PASSWORD_CAFE_MINIMA=Pass123! SEED_PASSWORD_DENTISTA_LOPEZ=Pass123! python backend/scripts/seed_tenants.py
+```
 
-### Deploy Frontend to Netlify
+Example with password file:
 
-1. Go to [Netlify](https://www.netlify.com) and add a new site from GitHub.
-2. Set the **Base directory** to `frontend`.
-3. Build command: `yarn build`
-4. Publish directory: `frontend/build`
-5. Add the Environment Variable:
-   - `REACT_APP_BACKEND_URL` = `https://your-backend.onrender.com` (The URL provided by Render)
-6. Deploy!
-*(Note: A `public/_redirects` file is already included to support React Router client-side routing on Netlify).*
+```json
+{
+  "cafe-minima": "Pass123!",
+  "dentista-lopez": "Pass123!"
+}
+```
 
----
+Then:
 
-## 📱 Features
+```bash
+SEED_PASSWORDS_FILE=backend/scripts/seed_passwords.json python backend/scripts/seed_tenants.py
+```
 
-- **Dynamic Routing**: Visit `/cafe-minima` or `/dentista-lopez` to see different business profiles.
-- **Admin Dashboard**: Visit `/admin/cafe-minima` (Password: `1234`) to view captured leads.
-- **Lead Capture**: Automatically extracts Name, Phone (10 digits), and Intent from natural Spanish conversation without forms.
+## Deployment notes
+
+### Backend
+
+- `render.yaml` only covers the backend service
+- Review and replace `CORS_ORIGINS` before deploy
+- Add real secret values for `MONGO_URL`, `DEEPSEEK_API_KEY` and `ADMIN_PASSWORD` in your provider dashboard
+- Keep `LEGACY_FALLBACK_ENABLED=true` until regression testing is complete
+
+### Frontend
+
+- Set `REACT_APP_BACKEND_URL` to your backend origin, for example `https://your-backend.example.com`
+- The app will append `/api` automatically if you omit it
+- Use a provider that serves the SPA fallback correctly for React Router
+
+## Security and operational notes
+
+- There is no default admin password
+- `/crm` is the global/legacy-compatible CRM entry
+- `/crm/:slug` is the tenant-scoped CRM entry
+- `/internal/tenants` uses the global admin password, not tenant passwords
+- `passlib==1.7.4` is pinned with `bcrypt==4.0.1` for compatibility; avoid upgrading `bcrypt` to `5.x` without revisiting auth hashing
+
+## Quick manual smoke test
+
+1. Open `/:slug` and confirm the public business loads
+2. Send a chat message and confirm the reply works
+3. Open `/crm`, log in, and verify lead listing
+4. Open `/internal/tenants`, log in with the global password, and verify tenant listing
+5. Toggle `LEGACY_FALLBACK_ENABLED=false` only after validating Mongo tenants still work and legacy routes fail as expected

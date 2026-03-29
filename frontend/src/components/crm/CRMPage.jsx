@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import axios from "axios";
 import { API } from "@/lib/api";
 import { normalizeSlug } from "@/lib/slug";
@@ -41,6 +41,40 @@ const formatDate = (isoString) => {
   });
 };
 
+const getApiDetail = (error) => {
+  if (!axios.isAxiosError(error)) return "";
+  const detail = error.response?.data?.detail;
+  return typeof detail === "string" ? detail : "";
+};
+
+const getRequestErrorMessage = (error, fallback) => {
+  if (!axios.isAxiosError(error)) {
+    return fallback.defaultMessage;
+  }
+
+  if (!error.response) {
+    return fallback.network || "No fue posible conectar con el backend.";
+  }
+
+  if (error.response.status === 401) {
+    return fallback.unauthorized || "Contraseña incorrecta.";
+  }
+
+  if (error.response.status === 400) {
+    return getApiDetail(error) || fallback.badRequest || fallback.defaultMessage;
+  }
+
+  if (error.response.status === 404) {
+    return getApiDetail(error) || fallback.notFound || fallback.defaultMessage;
+  }
+
+  if (error.response.status === 422) {
+    return getApiDetail(error) || fallback.validation || fallback.defaultMessage;
+  }
+
+  return getApiDetail(error) || fallback.defaultMessage;
+};
+
 export default function CRMPage() {
   const [leads, setLeads] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -64,18 +98,43 @@ export default function CRMPage() {
   const [updating, setUpdating] = useState(false);
   const successTimerRef = useRef(null);
 
-  const getAuthHeaders = () => ({ "x-admin-password": adminPassword });
+  const getAuthHeaders = useCallback(() => ({ "x-admin-password": adminPassword }), [adminPassword]);
 
-  const handleUnauthorized = (message = "Contraseña incorrecta") => {
+  const clearSuccessTimer = useCallback(() => {
+    if (successTimerRef.current) {
+      window.clearTimeout(successTimerRef.current);
+      successTimerRef.current = null;
+    }
+  }, []);
+
+  const handleUnauthorized = useCallback((message = "Contraseña incorrecta.") => {
+    clearSuccessTimer();
     setAuthError(message);
     setAdminPassword("");
+    setPasswordInput("");
     setSelectedLead(null);
     setLeads([]);
+    setNotesDraft("");
     setError("");
     setSuccessMessage("");
     setDetailLoading(false);
     setUpdating(false);
-  };
+  }, [clearSuccessTimer]);
+
+  const handleLogout = useCallback(() => {
+    clearSuccessTimer();
+    setAdminPassword("");
+    setPasswordInput("");
+    setActiveSlug("");
+    setSelectedLead(null);
+    setLeads([]);
+    setNotesDraft("");
+    setAuthError("");
+    setError("");
+    setSuccessMessage("");
+    setDetailLoading(false);
+    setUpdating(false);
+  }, [clearSuccessTimer]);
 
   const validateSlugCandidate = async () => {
     const normalized = normalizeSlug(slugInput);
@@ -90,8 +149,13 @@ export default function CRMPage() {
       setActiveSlug(normalized);
       return normalized;
     } catch (err) {
+      setActiveSlug("");
       if (axios.isAxiosError(err) && err.response?.status === 404) {
-        setSlugError(`No existe un tenant con el slug "${normalized}".`);
+        setSlugError(`No existe un tenant activo con el slug "${normalized}".`);
+      } else if (axios.isAxiosError(err) && err.response?.status === 400) {
+        setSlugError(getApiDetail(err) || "El slug no es valido.");
+      } else if (axios.isAxiosError(err) && !err.response) {
+        setSlugError("No fue posible validar el slug porque el backend no responde.");
       } else {
         setSlugError("No fue posible validar el slug en este momento.");
       }
@@ -101,7 +165,7 @@ export default function CRMPage() {
     }
   };
 
-  const loadLeads = async () => {
+  const loadLeads = useCallback(async () => {
     if (!adminPassword) {
       return;
     }
@@ -127,17 +191,32 @@ export default function CRMPage() {
         handleUnauthorized("Contraseña incorrecta.");
         return;
       }
-      setError("No fue posible cargar los leads.");
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        const previousSlug = activeSlug;
+        handleLogout();
+        if (previousSlug) {
+          setSlugError(`El tenant "${previousSlug}" ya no esta disponible o fue desactivado.`);
+        } else {
+          setAuthError("El modo legacy no esta disponible en este momento.");
+        }
+        return;
+      }
+      setError(
+        getRequestErrorMessage(err, {
+          validation: "Los filtros enviados no son validos.",
+          defaultMessage: "No fue posible cargar los leads.",
+        })
+      );
       console.error("CRM list error", err);
     } finally {
       setLoading(false);
     }
-  };
+  }, [activeSlug, adminPassword, getAuthHeaders, handleLogout, handleUnauthorized, searchQuery, statusFilter]);
 
   useEffect(() => {
     if (!adminPassword) return;
     loadLeads();
-  }, [adminPassword, searchQuery, statusFilter, refreshKey, activeSlug]);
+  }, [adminPassword, loadLeads, refreshKey]);
 
   const handleSearch = () => {
     setSearchQuery(searchText.trim());
@@ -150,6 +229,8 @@ export default function CRMPage() {
   const handlePasswordSubmit = async (event) => {
     event.preventDefault();
     setAuthError("");
+    setError("");
+    setSuccessMessage("");
     setSlugError("");
     const trimmed = passwordInput.trim();
     if (!trimmed) {
@@ -164,13 +245,6 @@ export default function CRMPage() {
     }
     setAdminPassword(trimmed);
     setIsAuthenticating(false);
-  };
-
-  const handleLogout = () => {
-    setAdminPassword("");
-    setPasswordInput("");
-    setSelectedLead(null);
-    setLeads([]);
   };
 
   const handlePickLead = async (lead) => {
@@ -189,7 +263,15 @@ export default function CRMPage() {
         handleUnauthorized("Contraseña incorrecta.");
         return;
       }
-      setError("No fue posible obtener el detalle del lead.");
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        setSelectedLead(null);
+      }
+      setError(
+        getRequestErrorMessage(err, {
+          notFound: "El lead ya no existe o ya no esta disponible.",
+          defaultMessage: "No fue posible obtener el detalle del lead.",
+        })
+      );
       console.error("CRM detail error", err);
     } finally {
       setDetailLoading(false);
@@ -218,7 +300,13 @@ export default function CRMPage() {
         handleUnauthorized("Contraseña incorrecta.");
         return;
       }
-      setError("No se pudo actualizar el estado.");
+      setError(
+        getRequestErrorMessage(err, {
+          notFound: "El lead ya no esta disponible.",
+          validation: "El estado enviado no es valido.",
+          defaultMessage: "No se pudo actualizar el estado.",
+        })
+      );
       console.error("CRM status update error", err);
     } finally {
       setUpdating(false);
@@ -246,7 +334,12 @@ export default function CRMPage() {
         handleUnauthorized("Contraseña incorrecta.");
         return;
       }
-      setError("No fue posible guardar las notas.");
+      setError(
+        getRequestErrorMessage(err, {
+          notFound: "El lead ya no esta disponible.",
+          defaultMessage: "No fue posible guardar las notas.",
+        })
+      );
       console.error("CRM notes update error", err);
     } finally {
       setUpdating(false);
@@ -255,9 +348,7 @@ export default function CRMPage() {
 
   const showSuccess = (message) => {
     setSuccessMessage(message);
-    if (successTimerRef.current) {
-      window.clearTimeout(successTimerRef.current);
-    }
+    clearSuccessTimer();
     successTimerRef.current = window.setTimeout(() => {
       setSuccessMessage("");
     }, 3000);
@@ -265,11 +356,9 @@ export default function CRMPage() {
 
   useEffect(() => {
     return () => {
-      if (successTimerRef.current) {
-        window.clearTimeout(successTimerRef.current);
-      }
+      clearSuccessTimer();
     };
-  }, []);
+  }, [clearSuccessTimer]);
 
   if (!adminPassword) {
     return (

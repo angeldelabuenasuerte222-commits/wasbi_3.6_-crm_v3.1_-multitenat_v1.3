@@ -1,6 +1,8 @@
 import logging
 import os
 import re
+import secrets
+from enum import Enum
 from datetime import datetime, timezone
 import sys # Import sys for SystemExit
 from pathlib import Path
@@ -16,6 +18,11 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from bson import ObjectId
 from passlib.context import CryptContext
+
+try:
+    from backend.legacy_configs import CLIENT_CONFIGS, DEFAULT_SLUG, DEMO_SLUGS
+except ModuleNotFoundError:
+    from legacy_configs import CLIENT_CONFIGS, DEFAULT_SLUG, DEMO_SLUGS
 
 # Setup Logging - Clean, Production Ready
 logging.basicConfig(
@@ -108,6 +115,19 @@ def ensure_valid_slug(value: str) -> str:
 def _format_slug_for_log(slug: Optional[str]) -> str:
     return slug if slug else "None"
 
+
+def get_default_system_prompt() -> str:
+    return CLIENT_CONFIGS[DEFAULT_SLUG]["system_prompt"]
+
+
+def _matches_global_admin_password(provided_password: Optional[str]) -> bool:
+    return bool(provided_password) and secrets.compare_digest(provided_password, ADMIN_PASSWORD)
+
+
+def _is_tenant_active(tenant: Dict[str, Any]) -> bool:
+    return tenant.get("is_active", True)
+
+
 async def verify_tenant_admin_password(slug: Optional[str], provided_password: Optional[str]) -> None:
     if not provided_password:
         _log_migration_event(
@@ -122,6 +142,16 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
     if slug:
         tenant = await get_tenant_by_slug(slug)
         if tenant:
+            if not _is_tenant_active(tenant):
+                _log_migration_event(
+                    "tenant_admin_auth",
+                    slug,
+                    "MONGO",
+                    legacy_auth=False,
+                    result="failure",
+                    reason="inactive_tenant"
+                )
+                raise HTTPException(status_code=401, detail="Unauthorized")
             admin_config = tenant.get("admin_config", {})
             password_hash = admin_config.get("password_hash")
             if password_hash:
@@ -159,7 +189,7 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
                 reason="missing_tenant"
             )
 
-    fallback_requested = provided_password == ADMIN_PASSWORD
+    fallback_requested = _matches_global_admin_password(provided_password)
     if fallback_requested:
         if LEGACY_FALLBACK_ENABLED:
             _log_migration_event(
@@ -193,17 +223,42 @@ async def verify_tenant_admin_password(slug: Optional[str], provided_password: O
 
 async def verify_admin_password(
     slug: Optional[str],
-    x_admin_password: Optional[str],
-    password_query: Optional[str] = None
+    x_admin_password: Optional[str]
 ) -> None:
-    provided = x_admin_password if x_admin_password is not None else password_query
-    await verify_tenant_admin_password(slug, provided)
+    await verify_tenant_admin_password(slug, x_admin_password)
+
+
+async def verify_internal_admin_password(provided_password: Optional[str]) -> None:
+    if not provided_password:
+        _log_migration_event(
+            "internal_admin_auth",
+            None,
+            "LEGACY_GLOBAL",
+            reason="missing_password"
+        )
+        raise HTTPException(status_code=401, detail="Cabecera x-admin-password requerida.")
+
+    if _matches_global_admin_password(provided_password):
+        _log_migration_event(
+            "internal_admin_auth",
+            None,
+            "LEGACY_GLOBAL",
+            result="success"
+        )
+        return
+
+    _log_migration_event(
+        "internal_admin_auth",
+        None,
+        "LEGACY_GLOBAL",
+        result="failure",
+        reason="invalid_global_password"
+    )
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 async def ensure_internal_admin(x_admin_password: Optional[str]) -> None:
-    if not x_admin_password:
-        raise HTTPException(status_code=401, detail="Cabecera x-admin-password requerida.")
-    await verify_admin_password(None, x_admin_password)
+    await verify_internal_admin_password(x_admin_password)
 
 # MongoDB connection
 client = AsyncIOMotorClient(MONGO_URL)
@@ -269,16 +324,17 @@ async def get_tenant_by_slug(slug: str) -> Optional[Dict[str, Any]]:
     Busca un tenant en la colección 'tenants' por slug.
     Retorna None si no existe.
     """
-    if not slug:
+    normalized_slug = normalize_slug(slug) if slug else ""
+    if not normalized_slug:
         return None
     
-    tenant_doc = await db.tenants.find_one({"slug": slug})
+    tenant_doc = await db.tenants.find_one({"slug": normalized_slug})
     if tenant_doc:
         tenant_doc["id"] = str(tenant_doc.pop("_id"))
-        logger.info("Tenant encontrado en Mongo: slug=%s", slug)
+        logger.info("Tenant encontrado en Mongo: slug=%s", normalized_slug)
         return tenant_doc
     
-    logger.debug("Tenant NO encontrado en Mongo: slug=%s (usando fallback)", slug)
+    logger.debug("Tenant NO encontrado en Mongo: slug=%s (usando fallback)", normalized_slug)
     return None
 
 
@@ -295,7 +351,6 @@ def build_public_business_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
         "avatar": tenant.get("avatar", ""),
         "image": tenant.get("image", ""),
         "greeting": tenant.get("greeting", "Hola, ¿en qué puedo ayudarte?"),
-        "_source": "mongo"  # Flag para debugging
     }
 
 app = FastAPI(title="WHASABI API")
@@ -319,65 +374,46 @@ async def global_exception_handler(request: Request, exc: Exception):
 # In-memory store for chat history and lead state
 chat_sessions: Dict[str, Dict[str, Any]] = {}
 
-# Multi-client mock configuration
-# Legacy placeholder configs (temporary compat layer, remove once Mongo has every tenant).
-CLIENT_CONFIGS = {
-    "cafe-minima": {
-        "business_name": "Café Mínima",
-        "system_prompt": "Eres el asistente virtual de Café Mínima en México. Eres amigable, respondes dudas sobre el menú, horarios y ubicación. Tu objetivo es ayudar y guiar al usuario para que comparta su nombre y teléfono de manera natural. Respuestas muy breves (máximo 3 líneas).",
-        "phone": "+52 55 1234 5678",
-        "hours": "8:00 AM - 6:00 PM",
-        "address": "Roma Norte, CDMX",
-        "avatar": "https://images.unsplash.com/photo-1550567433-89a8ed4b23fa?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAxODF8MHwxfHNlYXJjaHwxfHxtb2Rlcm4lMjBtaW5pbWFsJTIwY2FmZSUyMHN0b3JlZnJvbnR8ZW58MHx8fHwxNzc0NTAyNTg0fDA&ixlib=rb-4.1.0&q=85",
-        "image": "https://images.unsplash.com/photo-1752754331999-a20ee211ec20?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAxODF8MHwxfHNlYXJjaHwyfHxtb2Rlcm4lMjBtaW5pbWFsJTIwY2FmZSUyMHN0b3JlZnJvbnR8ZW58MHx8fHwxNzc0NTAyNTg0fDA&ixlib=rb-4.1.0&q=85",
-        "greeting": "¡Hola! Soy el asistente virtual de Café Mínima. ¿En qué te puedo ayudar hoy?"
-    },
-    "dentista-lopez": {
-        "business_name": "Dentista López",
-        "system_prompt": "Eres el recepcionista virtual del consultorio Dentista López en México. Eres profesional y empático. Ayudas a los pacientes a resolver dudas sobre servicios dentales y buscar agendar citas. Tu objetivo es obtener su nombre y teléfono para que el doctor los contacte. Respuestas muy breves (máximo 3 líneas).",
-        "phone": "+52 55 9876 5432",
-        "hours": "9:00 AM - 7:00 PM",
-        "address": "Polanco, CDMX",
-        "avatar": "https://images.unsplash.com/photo-1598256989800-fea5ce514169?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAxODF8MHwxfHNlYXJjaHwzfHxkZW50aXN0fGVufDB8fHx8MTY4MzY0MzUzM3ww&ixlib=rb-4.1.0&q=85",
-        "image": "https://images.unsplash.com/photo-1606811841689-23dfddce3e95?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAxODF8MHwxfHNlYXJjaHwyfHxkZW50aXN0JTIwb2ZmaWNlfGVufDB8fHx8MTY4MzY0MzU0Mnww&ixlib=rb-4.1.0&q=85",
-        "greeting": "¡Hola! Bienvenido al consultorio Dentista López. ¿En qué puedo ayudarte?"
-    },
-    "default": {
-        "business_name": "Negocio Demo",
-        "system_prompt": "Eres un asistente virtual profesional para un negocio local en México. Tu objetivo es ayudar a los clientes y guiarlos para que dejen su nombre y teléfono. Respuestas muy breves (máximo 3 líneas).",
-        "phone": "+52 55 0000 0000",
-        "hours": "Lunes a Viernes, 9AM - 5PM",
-        "address": "Centro Histórico, CDMX",
-        "avatar": "https://images.unsplash.com/photo-1497366216548-37526070297c?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAxODF8MHwxfHNlYXJjaHwzfHxidXNpbmVzc3xlbnwwfHx8fDE2ODM2NDM1NTZ8MA&ixlib=rb-4.1.0&q=85",
-        "image": "https://images.unsplash.com/photo-1497366216548-37526070297c?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAxODF8MHwxfHNlYXJjaHwzfHxidXNpbmVzc3xlbnwwfHx8fDE2ODM2NDM1NTZ8MA&ixlib=rb-4.1.0&q=85",
-        "greeting": "Hola, soy el asistente virtual de este negocio. ¿Cómo puedo ayudarte?"
-    }
-}
-
-DEFAULT_SLUG = "default"
-DEMO_SLUGS = {DEFAULT_SLUG}
-
-
 def _build_chat_config_from_tenant(tenant: Dict[str, Any]) -> Dict[str, Any]:
     config = build_public_business_config(tenant)
-    config["system_prompt"] = tenant.get("system_prompt", "")
+    config["system_prompt"] = tenant.get("system_prompt") or get_default_system_prompt()
     return config
 
 
+def build_public_business_config_from_legacy(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "business_name": config.get("business_name", "Negocio"),
+        "phone": config.get("phone", ""),
+        "hours": config.get("hours", ""),
+        "address": config.get("address", ""),
+        "avatar": config.get("avatar", ""),
+        "image": config.get("image", ""),
+        "greeting": config.get("greeting", "Hola, ¿en qué puedo ayudarte?"),
+    }
+
+
+def _chat_session_key(session_id: str, resolved_slug: str) -> str:
+    return f"{resolved_slug}:{session_id}"
+
+
 async def _resolve_chat_config(raw_slug: Optional[str]) -> Tuple[Dict[str, Any], str, Optional[str], str]:
-    slug = raw_slug.strip() if raw_slug else ""
+    slug = normalize_slug(raw_slug) if raw_slug else ""
     if slug:
         tenant = await get_tenant_by_slug(slug)
         if tenant:
+            if not _is_tenant_active(tenant):
+                _log_migration_event("chat_config", slug, "MONGO", reason="inactive_tenant")
+                raise HTTPException(
+                    status_code=404,
+                    detail="Configuración de chat no encontrada para el slug solicitado."
+                )
             config = _build_chat_config_from_tenant(tenant)
             _log_migration_event("chat_config", slug, "MONGO")
             return config, slug, tenant["id"], "MONGO"
 
         if slug in DEMO_SLUGS:
             _log_migration_event("chat_config", slug, "DEFAULT_ONLY_WHEN_ALLOWED")
-            default_config = dict(CLIENT_CONFIGS[DEFAULT_SLUG])
-            default_config["_source"] = "default_only_when_allowed"
-            return default_config, DEFAULT_SLUG, None, "DEFAULT_ONLY_WHEN_ALLOWED"
+            return dict(CLIENT_CONFIGS[DEFAULT_SLUG]), DEFAULT_SLUG, None, "DEFAULT_ONLY_WHEN_ALLOWED"
 
         legacy_config = CLIENT_CONFIGS.get(slug)
         if legacy_config:
@@ -393,15 +429,13 @@ async def _resolve_chat_config(raw_slug: Optional[str]) -> Tuple[Dict[str, Any],
                     detail="Legacy chat configuration is temporarily disabled."
                 )
             _log_migration_event("chat_config", slug, "LEGACY_FALLBACK")
-            return {**legacy_config, "_source": "legacy_fallback"}, slug, None, "LEGACY_FALLBACK"
+            return dict(legacy_config), slug, None, "LEGACY_FALLBACK"
 
         _log_migration_event("chat_config", slug, "NOT_FOUND", reason="missing_config")
         raise HTTPException(status_code=404, detail="Configuración de chat no encontrada para el slug solicitado.")
 
     _log_migration_event("chat_config", "<empty>", "DEFAULT_ONLY_WHEN_ALLOWED")
-    default_config = dict(CLIENT_CONFIGS[DEFAULT_SLUG])
-    default_config["_source"] = "default_only_when_allowed"
-    return default_config, DEFAULT_SLUG, None, "DEFAULT_ONLY_WHEN_ALLOWED"
+    return dict(CLIENT_CONFIGS[DEFAULT_SLUG]), DEFAULT_SLUG, None, "DEFAULT_ONLY_WHEN_ALLOWED"
 
 NAME_PATTERNS = [
     re.compile(r"(?:me llamo|mi nombre es|soy)\s+([^\W\d_]+(?:\s+[^\W\d_]+){0,3})", re.IGNORECASE),
@@ -441,32 +475,44 @@ class ChatMessage(BaseModel):
     session_id: str = Field(..., max_length=100)
     slug: Optional[str] = Field("default", max_length=50)
 
+
+class LeadStatus(str, Enum):
+    nuevo = "nuevo"
+    contactado = "contactado"
+    en_proceso = "en_proceso"
+    perdido = "perdido"
+    cerrado = "cerrado"
+    descartado = "descartado"
+
+
 class LeadUpdate(BaseModel):
-    status: Optional[str] = Field(None, description="Estado administrativo del lead")
-    notes: Optional[str] = Field(None, description="Notas internas sobre el lead")
+    status: Optional[LeadStatus] = Field(None, description="Estado administrativo del lead")
+    notes: Optional[str] = Field(None, max_length=4000, description="Notas internas sobre el lead")
 
 
 class TenantCreate(BaseModel):
-    slug: str = Field(..., description="Identificador único del tenant")
-    business_name: str = Field(..., min_length=1)
-    phone: str = Field("", description="Teléfono visible del negocio")
-    hours: str = Field("", description="Horarios del negocio")
-    address: str = Field("", description="Dirección del negocio")
-    avatar: str = Field("", description="URL de avatar")
-    image: str = Field("", description="URL de imagen de portada")
-    greeting: str = Field("", description="Saludo inicial del asistente")
+    slug: str = Field(..., max_length=50, description="Identificador único del tenant")
+    business_name: str = Field(..., min_length=1, max_length=120)
+    phone: str = Field("", max_length=80, description="Teléfono visible del negocio")
+    hours: str = Field("", max_length=120, description="Horarios del negocio")
+    address: str = Field("", max_length=255, description="Dirección del negocio")
+    avatar: str = Field("", max_length=500, description="URL de avatar")
+    image: str = Field("", max_length=500, description="URL de imagen de portada")
+    greeting: str = Field("", max_length=500, description="Saludo inicial del asistente")
+    system_prompt: Optional[str] = Field(None, max_length=2500, description="Prompt interno del asistente")
     admin_password: str = Field(..., min_length=8, description="Contraseña para admin")
     is_active: bool = Field(True, description="Si el tenant está activo")
 
 
 class TenantUpdate(BaseModel):
-    business_name: Optional[str] = Field(None, description="Nombre del negocio")
-    phone: Optional[str] = Field(None)
-    hours: Optional[str] = Field(None)
-    address: Optional[str] = Field(None)
-    avatar: Optional[str] = Field(None)
-    image: Optional[str] = Field(None)
-    greeting: Optional[str] = Field(None)
+    business_name: Optional[str] = Field(None, max_length=120, description="Nombre del negocio")
+    phone: Optional[str] = Field(None, max_length=80)
+    hours: Optional[str] = Field(None, max_length=120)
+    address: Optional[str] = Field(None, max_length=255)
+    avatar: Optional[str] = Field(None, max_length=500)
+    image: Optional[str] = Field(None, max_length=500)
+    greeting: Optional[str] = Field(None, max_length=500)
+    system_prompt: Optional[str] = Field(None, max_length=2500)
     admin_password: Optional[str] = Field(None, min_length=8)
     is_active: Optional[bool] = Field(None, description="Activa/desactiva tenant")
 
@@ -510,19 +556,23 @@ async def get_business(slug: str):
     3. Si tampoco está en legacy, responde con 404
     """
     # --- INTENTO 1: Buscar en MongoDB (NUEVO) ---
-    tenant = await get_tenant_by_slug(slug)
+    normalized_slug = normalize_slug(slug)
+    tenant = await get_tenant_by_slug(normalized_slug)
     if tenant:
+        if not _is_tenant_active(tenant):
+            _log_migration_event("get_business", normalized_slug, "MONGO", reason="inactive_tenant")
+            raise HTTPException(status_code=404, detail="Configuración no encontrada para ese negocio")
         config = build_public_business_config(tenant)
-        _log_migration_event("get_business", slug, "MONGO")
+        _log_migration_event("get_business", normalized_slug, "MONGO")
         return config
     
     # --- INTENTO 2: Fallback a CLIENT_CONFIGS (LEGACY - TEMPORAL) ---
-    legacy_config = CLIENT_CONFIGS.get(slug)
+    legacy_config = CLIENT_CONFIGS.get(normalized_slug)
     if legacy_config:
         if not LEGACY_FALLBACK_ENABLED:
             _log_migration_event(
                 "get_business",
-                slug,
+                normalized_slug,
                 "LEGACY_FALLBACK",
                 fallback_disabled="true"
             )
@@ -530,54 +580,67 @@ async def get_business(slug: str):
                 status_code=404,
                 detail="Legacy business configuration is temporarily disabled."
             )
-        _log_migration_event("get_business", slug, "LEGACY_FALLBACK")
-        return {**legacy_config, "_source": "legacy_fallback"}
+        _log_migration_event("get_business", normalized_slug, "LEGACY_FALLBACK")
+        return build_public_business_config_from_legacy(legacy_config)
 
-    _log_migration_event("get_business", slug, "NOT_FOUND", reason="missing_config")
+    _log_migration_event("get_business", normalized_slug, "NOT_FOUND", reason="missing_config")
     raise HTTPException(status_code=404, detail="Configuración no encontrada para ese negocio")
 
 @api_router.get("/leads/{identifier}")
 async def get_leads(
     identifier: str,
-    password: Optional[str] = None,
+    request: Request,
     x_admin_password: Optional[str] = Header(None)
 ):
-    if ObjectId.is_valid(identifier) and password is None:
+    if "password" in request.query_params:
+        raise HTTPException(status_code=400, detail="Usa la cabecera x-admin-password.")
+
+    normalized_identifier = normalize_slug(identifier)
+    tenant = await get_tenant_by_slug(normalized_identifier)
+    if tenant or normalized_identifier in CLIENT_CONFIGS:
+        await verify_admin_password(normalized_identifier, x_admin_password)
+        leads = await db.leads.find({"slug": normalized_identifier}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+        return leads
+
+    if ObjectId.is_valid(identifier):
         logger.info("Read lead id=%s", identifier)
         lead_doc = await db.leads.find_one({"_id": ObjectId(identifier)})
         if not lead_doc:
             raise HTTPException(status_code=404, detail="Lead no encontrado")
-        await verify_admin_password(lead_doc.get("slug"), x_admin_password, password)
+        await verify_admin_password(lead_doc.get("slug"), x_admin_password)
         return serialize_lead(lead_doc)
 
-    await verify_admin_password(identifier, x_admin_password, password)
-    leads = await db.leads.find({"slug": identifier}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    await verify_admin_password(normalized_identifier, x_admin_password)
+    leads = await db.leads.find({"slug": normalized_identifier}, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return leads
 
 
 @api_router.get("/leads")
 async def list_leads(
     q: Optional[str] = None,
-    status: Optional[str] = None,
+    status: Optional[LeadStatus] = None,
     slug: Optional[str] = None,
     limit: int = 200,
     x_admin_password: Optional[str] = Header(None)
 ):
-    await verify_admin_password(slug, x_admin_password)
+    normalized_slug = normalize_slug(slug) if slug else None
+    await verify_admin_password(normalized_slug, x_admin_password)
     filters: Dict[str, Any] = {}
-    if slug:
-        filters["slug"] = slug
+    if normalized_slug:
+        filters["slug"] = normalized_slug
     if status:
-        filters["status"] = status
+        filters["status"] = status.value
     if q:
-        filters["$or"] = [
-            {"nombre": {"$regex": q, "$options": "i"}},
-            {"telefono": {"$regex": q, "$options": "i"}},
-            {"consulta": {"$regex": q, "$options": "i"}},
-        ]
+        escaped_query = re.escape(q.strip())
+        if escaped_query:
+            filters["$or"] = [
+                {"nombre": {"$regex": escaped_query, "$options": "i"}},
+                {"telefono": {"$regex": escaped_query, "$options": "i"}},
+                {"consulta": {"$regex": escaped_query, "$options": "i"}},
+            ]
 
     safe_limit = min(max(limit, 1), 500)
-    logger.info("List leads slug=%r status=%r q=%r limit=%d", slug, status, q, safe_limit)
+    logger.info("List leads slug=%r status=%r q=%r limit=%d", normalized_slug, status, q, safe_limit)
 
     cursor = (
         db.leads.find(filters)
@@ -607,7 +670,7 @@ async def update_lead(
 
     update_fields: Dict[str, Any] = {}
     if payload.status is not None:
-        update_fields["status"] = payload.status
+        update_fields["status"] = payload.status.value
     if payload.notes is not None:
         update_fields["notes"] = payload.notes
 
@@ -650,6 +713,7 @@ async def create_internal_tenant(
         "avatar": payload.avatar.strip(),
         "image": payload.image.strip(),
         "greeting": payload.greeting.strip(),
+        "system_prompt": (payload.system_prompt or "").strip() or get_default_system_prompt(),
         "is_active": payload.is_active,
         "admin_config": {"password_hash": crypt_context.hash(payload.admin_password)},
         "created_at": now,
@@ -694,6 +758,8 @@ async def update_internal_tenant(
     _set_field("avatar", payload.avatar)
     _set_field("image", payload.image)
     _set_field("greeting", payload.greeting)
+    if payload.system_prompt is not None:
+        update_fields["system_prompt"] = payload.system_prompt.strip() or get_default_system_prompt()
 
     if payload.admin_password:
         update_fields["admin_config.password_hash"] = crypt_context.hash(payload.admin_password)
@@ -724,10 +790,11 @@ async def handle_chat(message: ChatMessage):
         resolved_tenant_id or "legacy",
         config_source,
     )
+    session_key = _chat_session_key(session_id, resolved_slug)
 
     # Initialize session state if not exists
-    if session_id not in chat_sessions:
-        chat_sessions[session_id] = {
+    if session_key not in chat_sessions:
+        chat_sessions[session_key] = {
             "messages": [{"role": "system", "content": config["system_prompt"]}],
             "nombre": None,
             "telefono": None,
@@ -739,7 +806,7 @@ async def handle_chat(message: ChatMessage):
             "tenant_source": config_source,
         }
     
-    state = chat_sessions[session_id]
+    state = chat_sessions[session_key]
     state["slug"] = resolved_slug
     state["tenant_id"] = resolved_tenant_id
     state["tenant_source"] = config_source

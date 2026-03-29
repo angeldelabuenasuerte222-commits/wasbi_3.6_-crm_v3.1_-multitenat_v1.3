@@ -6,6 +6,28 @@ import { User, Phone, MessageSquare, Clock } from "lucide-react";
 import { API } from "@/lib/api";
 import { normalizeSlug } from "@/lib/slug";
 
+const getApiDetail = (error) => {
+  if (!axios.isAxiosError(error)) return "";
+  const detail = error.response?.data?.detail;
+  return typeof detail === "string" ? detail : "";
+};
+
+const getDashboardError = (error, fallback) => {
+  if (!axios.isAxiosError(error)) {
+    return fallback.defaultMessage;
+  }
+
+  if (!error.response) {
+    return fallback.network || "No fue posible conectar con el backend.";
+  }
+
+  if (error.response.status === 404) {
+    return getApiDetail(error) || fallback.notFound || fallback.defaultMessage;
+  }
+
+  return getApiDetail(error) || fallback.defaultMessage;
+};
+
 export default function AdminDashboard() {
   const { slug: rawSlug } = useParams();
   const slug = normalizeSlug(rawSlug);
@@ -14,6 +36,45 @@ export default function AdminDashboard() {
   const [leads, setLeads] = useState([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [slugLoading, setSlugLoading] = useState(Boolean(slug));
+  const [slugError, setSlugError] = useState("");
+
+  useEffect(() => {
+    if (!slug) {
+      setSlugLoading(false);
+      setSlugError("");
+      return;
+    }
+
+    let cancelled = false;
+    setSlugLoading(true);
+    setSlugError("");
+
+    axios.get(`${API}/business/${slug}`)
+      .then(() => {
+        if (!cancelled) {
+          setSlugError("");
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setSlugError(
+          getDashboardError(err, {
+            notFound: `No existe un tenant activo con el slug "${slug}".`,
+            defaultMessage: "No fue posible validar el slug del CRM.",
+          })
+        );
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setSlugLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [slug]);
 
   if (!slug) {
     return (
@@ -21,10 +82,10 @@ export default function AdminDashboard() {
         <div className="max-w-md bg-[#1A1A1A] border border-white/10 rounded-3xl p-6 text-center space-y-4">
           <h2 className="text-2xl font-semibold">Slug requerido</h2>
           <p className="text-sm text-[#9CA3AF]">
-            La ruta del CRM para tenants necesita un slug válido (ej. <span className="text-[#22C55E] font-medium">/crm/cafe-minima</span>).
+            La ruta del CRM para tenants necesita un slug valido (ej. <span className="text-[#22C55E] font-medium">/crm/cafe-minima</span>).
           </p>
           <p className="text-xs text-[#9CA3AF]/80">
-            Mantén la compatibilidad legacy usando la vista global en <span className="text-[#22C55E] font-semibold">/crm</span>.
+            Manten la compatibilidad legacy usando la vista global en <span className="text-[#22C55E] font-semibold">/crm</span>.
           </p>
         </div>
       </div>
@@ -44,10 +105,15 @@ export default function AdminDashboard() {
       setLeads(response.data);
       setIsAuthenticated(true);
     } catch (err) {
-      if (err.response?.status === 401) {
+      if (axios.isAxiosError(err) && err.response?.status === 401) {
         setError("Contraseña incorrecta.");
       } else {
-        setError("Ocurrió un error al cargar los leads.");
+        setError(
+          getDashboardError(err, {
+            notFound: `El tenant "${slug}" ya no esta disponible.`,
+            defaultMessage: "No fue posible cargar los leads.",
+          })
+        );
       }
     } finally {
       setLoading(false);
@@ -64,6 +130,30 @@ export default function AdminDashboard() {
       minute: '2-digit' 
     });
   };
+
+  if (slugLoading) {
+    return (
+      <div className="min-h-screen bg-[#050505] flex items-center justify-center p-6 text-white">
+        <div className="max-w-md rounded-3xl border border-white/10 bg-[#1A1A1A] p-6 text-center">
+          Validando slug del CRM...
+        </div>
+      </div>
+    );
+  }
+
+  if (slugError) {
+    return (
+      <div className="min-h-screen bg-[#050505] flex items-center justify-center p-6 text-white">
+        <div className="max-w-md rounded-3xl border border-red-500/30 bg-[#1A1A1A] p-6 text-center space-y-4">
+          <h2 className="text-2xl font-semibold">Slug no disponible</h2>
+          <p className="text-sm text-[#9CA3AF]">{slugError}</p>
+          <p className="text-xs text-[#9CA3AF]/80">
+            Revisa la ruta o usa la vista global en <span className="text-[#22C55E] font-semibold">/crm</span>.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   if (!isAuthenticated) {
     return (
@@ -114,7 +204,11 @@ export default function AdminDashboard() {
             </p>
           </div>
           <button 
-            onClick={() => setIsAuthenticated(false)}
+            onClick={() => {
+              setIsAuthenticated(false);
+              setPassword("");
+              setError("");
+            }}
             className="text-sm text-[#9CA3AF] hover:text-white transition-colors"
           >
             Cerrar Sesión

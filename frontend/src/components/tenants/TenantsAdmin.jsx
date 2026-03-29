@@ -15,6 +15,40 @@ const emptyForm = {
   is_active: true,
 };
 
+const getApiDetail = (error) => {
+  if (!axios.isAxiosError(error)) return "";
+  const detail = error.response?.data?.detail;
+  return typeof detail === "string" ? detail : "";
+};
+
+const getRequestErrorMessage = (error, fallback) => {
+  if (!axios.isAxiosError(error)) {
+    return fallback.defaultMessage;
+  }
+
+  if (!error.response) {
+    return fallback.network || "No fue posible conectar con el backend.";
+  }
+
+  if (error.response.status === 401) {
+    return fallback.unauthorized || "Contraseña global incorrecta.";
+  }
+
+  if (error.response.status === 400) {
+    return getApiDetail(error) || fallback.badRequest || fallback.defaultMessage;
+  }
+
+  if (error.response.status === 404) {
+    return getApiDetail(error) || fallback.notFound || fallback.defaultMessage;
+  }
+
+  if (error.response.status === 422) {
+    return getApiDetail(error) || fallback.validation || fallback.defaultMessage;
+  }
+
+  return getApiDetail(error) || fallback.defaultMessage;
+};
+
 export default function TenantsAdmin() {
   const [adminPassword, setAdminPassword] = useState("");
   const [tenants, setTenants] = useState([]);
@@ -44,7 +78,17 @@ export default function TenantsAdmin() {
       });
       setTenants(response.data);
     } catch (err) {
-      setError("No fue posible cargar tenants. Verifica la contraseña.");
+      setMessage("");
+      if (axios.isAxiosError(err) && err.response?.status === 401) {
+        setTenants([]);
+        setError("Contraseña global incorrecta.");
+        return;
+      }
+      setError(
+        getRequestErrorMessage(err, {
+          defaultMessage: "No fue posible cargar tenants.",
+        })
+      );
       console.error("Tenants load error", err);
     } finally {
       setLoading(false);
@@ -84,6 +128,8 @@ export default function TenantsAdmin() {
       return;
     }
     setToggleLoading(tenant.slug);
+    setError("");
+    setMessage("");
     try {
       await axios.patch(
         `${API}/internal/tenants/${tenant.slug}`,
@@ -93,7 +139,13 @@ export default function TenantsAdmin() {
       setMessage(`Tenant ${tenant.slug} ahora está ${!tenant.is_active ? "activo" : "inactivo"}.`);
       await handleLoadTenants();
     } catch (err) {
-      setError("No se pudo actualizar el estado del tenant.");
+      setError(
+        getRequestErrorMessage(err, {
+          unauthorized: "Contraseña global incorrecta.",
+          notFound: `El tenant ${tenant.slug} ya no existe.`,
+          defaultMessage: "No se pudo actualizar el estado del tenant.",
+        })
+      );
       console.error("Toggle tenant error", err);
     } finally {
       setToggleLoading("");
@@ -150,7 +202,13 @@ export default function TenantsAdmin() {
       resetForm();
       await handleLoadTenants();
     } catch (err) {
-      setError("Ocurrió un error guardando el tenant.");
+      setError(
+        getRequestErrorMessage(err, {
+          badRequest: "Revisa el slug y los datos del tenant.",
+          validation: "Revisa los campos enviados antes de guardar.",
+          defaultMessage: "Ocurrio un error guardando el tenant.",
+        })
+      );
       console.error("Tenant submit error", err);
     } finally {
       setSubmitLoading(false);
