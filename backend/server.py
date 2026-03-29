@@ -181,14 +181,58 @@ def _raise_rate_limit(detail: str, retry_after_seconds: int) -> None:
     )
 
 
-def _ensure_rate_limit(bucket_key: str, limit: int, detail: str) -> None:
+def _get_rate_limit_retry_after(bucket_key: str, limit: int) -> Optional[int]:
     recent_events = _prune_rate_limit_bucket(bucket_key)
     if len(recent_events) < limit:
-        return
+        return None
 
     oldest_relevant_event = recent_events[0]
     elapsed = time.monotonic() - oldest_relevant_event
-    retry_after_seconds = int(RATE_LIMIT_WINDOW_SECONDS - elapsed) + 1
+    return max(int(RATE_LIMIT_WINDOW_SECONDS - elapsed) + 1, 1)
+
+
+def _log_rate_limit_event(
+    endpoint: str,
+    slug: Optional[str],
+    scope: str,
+    request: Optional[Request],
+    limit: int,
+    retry_after_seconds: int,
+) -> None:
+    _log_migration_event(
+        endpoint,
+        slug,
+        "RATE_LIMIT",
+        scope=scope,
+        ip=_get_request_ip(request),
+        limit=limit,
+        window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+        retry_after_seconds=retry_after_seconds,
+    )
+
+
+def _enforce_rate_limit(
+    *,
+    bucket_key: str,
+    limit: int,
+    detail: str,
+    endpoint: str,
+    slug: Optional[str],
+    scope: str,
+    request: Optional[Request],
+) -> None:
+    retry_after_seconds = _get_rate_limit_retry_after(bucket_key, limit)
+    if retry_after_seconds is None:
+        return
+
+    _log_rate_limit_event(
+        endpoint=endpoint,
+        slug=slug,
+        scope=scope,
+        request=request,
+        limit=limit,
+        retry_after_seconds=retry_after_seconds,
+    )
     _raise_rate_limit(detail, retry_after_seconds)
 
 
@@ -209,10 +253,15 @@ def _auth_rate_limit_key(slug: Optional[str], request: Optional[Request], scope:
 
 def _enforce_auth_rate_limit(slug: Optional[str], request: Optional[Request], scope: str) -> str:
     bucket_key = _auth_rate_limit_key(slug, request, scope)
-    _ensure_rate_limit(
-        bucket_key,
-        AUTH_RATE_LIMIT_PER_WINDOW,
-        "Demasiados intentos de autenticación. Intenta de nuevo en un momento.",
+    endpoint = "internal_admin_auth" if scope == "internal" else "tenant_admin_auth"
+    _enforce_rate_limit(
+        bucket_key=bucket_key,
+        limit=AUTH_RATE_LIMIT_PER_WINDOW,
+        detail="Demasiados intentos de autenticaci?n. Intenta de nuevo en un momento.",
+        endpoint=endpoint,
+        slug=slug,
+        scope=scope,
+        request=request,
     )
     return bucket_key
 
@@ -955,11 +1004,16 @@ async def handle_chat(message: ChatMessage, request: Request):
     session_id = message.session_id
     text = message.text.strip()
     lower_text = text.lower()
+    normalized_chat_slug = normalize_slug(message.slug) if message.slug else DEFAULT_SLUG
     chat_bucket_key = _chat_rate_limit_key(message.slug, request)
-    _ensure_rate_limit(
-        chat_bucket_key,
-        CHAT_RATE_LIMIT_PER_WINDOW,
-        "Demasiados mensajes en poco tiempo. Intenta de nuevo en un momento.",
+    _enforce_rate_limit(
+        bucket_key=chat_bucket_key,
+        limit=CHAT_RATE_LIMIT_PER_WINDOW,
+        detail="Demasiados mensajes en poco tiempo. Intenta de nuevo en un momento.",
+        endpoint="chat",
+        slug=normalized_chat_slug,
+        scope="chat",
+        request=request,
     )
     _record_rate_limit_event(chat_bucket_key)
 

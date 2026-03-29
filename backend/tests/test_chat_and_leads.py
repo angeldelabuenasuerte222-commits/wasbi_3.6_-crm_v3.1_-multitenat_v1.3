@@ -1,8 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from bson import ObjectId
 
-from backend.tests.support import create_client, make_lead, make_tenant
+from backend.tests.support import create_client, make_lead, make_tenant, server
 
 
 TENANT_PASSWORD = "TenantPass123!"
@@ -163,18 +164,27 @@ class ChatAndLeadsTests(unittest.TestCase):
         tenant = make_tenant("mongo-tenant", password=TENANT_PASSWORD)
         client, _, _ = create_client(tenants=[tenant], legacy_enabled=True, chat_limit=1)
 
-        first = client.post(
-            "/api/chat",
-            json={"text": "Hola", "session_id": "rate-limit-session", "slug": "mongo-tenant"},
-        )
-        second = client.post(
-            "/api/chat",
-            json={"text": "Hola otra vez", "session_id": "rate-limit-session", "slug": "mongo-tenant"},
-        )
+        with patch.object(server.logger, "info") as info_mock:
+            first = client.post(
+                "/api/chat",
+                json={"text": "Hola", "session_id": "rate-limit-session", "slug": "mongo-tenant"},
+            )
+            second = client.post(
+                "/api/chat",
+                json={"text": "Hola otra vez", "session_id": "rate-limit-session", "slug": "mongo-tenant"},
+            )
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 429)
         self.assertEqual(second.headers.get("Retry-After"), "60")
+        self.assertTrue(
+            any(
+                "endpoint=chat" in call.args[0]
+                and "source=RATE_LIMIT" in call.args[0]
+                and "scope=chat" in call.args[0]
+                for call in info_mock.call_args_list
+            )
+        )
 
     def test_update_lead_uses_tenant_id_owner_before_slug(self):
         attacker_tenant = make_tenant("mongo-tenant", password=TENANT_PASSWORD)

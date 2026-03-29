@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 
-from backend.tests.support import create_client, make_tenant
+from backend.tests.support import create_client, make_tenant, server
 
 
 GLOBAL_PASSWORD = "GlobalPass123!"
@@ -112,20 +113,53 @@ class AuthAndTenantsTests(unittest.TestCase):
         tenant = make_tenant("mongo-tenant", password=TENANT_PASSWORD)
         client, _, _ = create_client(tenants=[tenant], legacy_enabled=True, auth_limit=1)
 
-        first = client.get(
-            "/api/leads",
-            params={"slug": "mongo-tenant"},
-            headers={"x-admin-password": "wrong-password"},
-        )
-        second = client.get(
-            "/api/leads",
-            params={"slug": "mongo-tenant"},
-            headers={"x-admin-password": "wrong-password"},
-        )
+        with patch.object(server.logger, "info") as info_mock:
+            first = client.get(
+                "/api/leads",
+                params={"slug": "mongo-tenant"},
+                headers={"x-admin-password": "wrong-password"},
+            )
+            second = client.get(
+                "/api/leads",
+                params={"slug": "mongo-tenant"},
+                headers={"x-admin-password": "wrong-password"},
+            )
 
         self.assertEqual(first.status_code, 401)
         self.assertEqual(second.status_code, 429)
         self.assertEqual(second.headers.get("Retry-After"), "60")
+        self.assertTrue(
+            any(
+                "endpoint=tenant_admin_auth" in call.args[0]
+                and "source=RATE_LIMIT" in call.args[0]
+                and "scope=tenant" in call.args[0]
+                for call in info_mock.call_args_list
+            )
+        )
+
+    def test_internal_admin_rate_limit_is_logged(self):
+        client, _, _ = create_client(legacy_enabled=True, auth_limit=1)
+
+        with patch.object(server.logger, "info") as info_mock:
+            first = client.get(
+                "/api/internal/tenants",
+                headers={"x-admin-password": "wrong-password"},
+            )
+            second = client.get(
+                "/api/internal/tenants",
+                headers={"x-admin-password": "wrong-password"},
+            )
+
+        self.assertEqual(first.status_code, 401)
+        self.assertEqual(second.status_code, 429)
+        self.assertTrue(
+            any(
+                "endpoint=internal_admin_auth" in call.args[0]
+                and "source=RATE_LIMIT" in call.args[0]
+                and "scope=internal" in call.args[0]
+                for call in info_mock.call_args_list
+            )
+        )
 
 
 if __name__ == "__main__":
