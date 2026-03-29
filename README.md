@@ -18,6 +18,8 @@ Fullstack multi-tenant project with:
 
 Legacy fallback is still available and is controlled by `LEGACY_FALLBACK_ENABLED`.
 
+Release and deploy checklist: `RELEASE_CHECKLIST.md`
+
 ## What belongs where
 
 ### GitHub
