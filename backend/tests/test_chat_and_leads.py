@@ -102,7 +102,7 @@ class ChatAndLeadsTests(unittest.TestCase):
 
     def test_list_leads_normalizes_slug_query_case(self):
         tenant = make_tenant("mongo-tenant", password=TENANT_PASSWORD)
-        lead = make_lead(slug="mongo-tenant", tenant_id="tenant-1")
+        lead = make_lead(slug="mongo-tenant", tenant_id=str(tenant["_id"]))
         client, _, _ = create_client(tenants=[tenant], leads=[lead], legacy_enabled=True)
 
         response = client.get(
@@ -115,10 +115,43 @@ class ChatAndLeadsTests(unittest.TestCase):
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.json()[0]["slug"], "mongo-tenant")
 
+    def test_mongo_tenant_lead_list_prefers_tenant_id_but_keeps_legacy_same_slug(self):
+        tenant = make_tenant("mongo-tenant", password=TENANT_PASSWORD)
+        correct_lead = make_lead(
+            slug="mongo-tenant",
+            tenant_id=str(tenant["_id"]),
+            nombre="Propio",
+        )
+        legacy_lead = make_lead(
+            slug="mongo-tenant",
+            tenant_id=None,
+            nombre="Legacy",
+        )
+        foreign_lead = make_lead(
+            slug="mongo-tenant",
+            tenant_id=str(ObjectId()),
+            nombre="Ajeno",
+        )
+        client, _, _ = create_client(
+            tenants=[tenant],
+            leads=[correct_lead, legacy_lead, foreign_lead],
+            legacy_enabled=True,
+        )
+
+        response = client.get(
+            "/api/leads",
+            params={"slug": "mongo-tenant"},
+            headers={"x-admin-password": TENANT_PASSWORD},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        returned_names = {lead["nombre"] for lead in response.json()}
+        self.assertEqual(returned_names, {"Propio", "Legacy"})
+
     def test_hex_slug_with_24_chars_should_resolve_as_slug_not_object_id(self):
         slug = "abcdefabcdefabcdefabcdef"
         tenant = make_tenant(slug, password=TENANT_PASSWORD)
-        lead = make_lead(slug=slug, tenant_id="tenant-hex")
+        lead = make_lead(slug=slug, tenant_id=str(tenant["_id"]))
         client, _, _ = create_client(tenants=[tenant], leads=[lead], legacy_enabled=True)
 
         response = client.get(f"/api/leads/{slug}", headers={"x-admin-password": TENANT_PASSWORD})
@@ -142,6 +175,36 @@ class ChatAndLeadsTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 429)
         self.assertEqual(second.headers.get("Retry-After"), "60")
+
+    def test_update_lead_uses_tenant_id_owner_before_slug(self):
+        attacker_tenant = make_tenant("mongo-tenant", password=TENANT_PASSWORD)
+        owner_password = "OwnerPass123!"
+        owner_tenant = make_tenant("owner-tenant", password=owner_password)
+        foreign_owned_lead = make_lead(
+            slug="mongo-tenant",
+            tenant_id=str(owner_tenant["_id"]),
+            _id=ObjectId(),
+        )
+        client, _, _ = create_client(
+            tenants=[attacker_tenant, owner_tenant],
+            leads=[foreign_owned_lead],
+            legacy_enabled=True,
+        )
+
+        attacker_response = client.patch(
+            f"/api/leads/{foreign_owned_lead['_id']}",
+            json={"status": "contactado"},
+            headers={"x-admin-password": TENANT_PASSWORD},
+        )
+        owner_response = client.patch(
+            f"/api/leads/{foreign_owned_lead['_id']}",
+            json={"status": "contactado"},
+            headers={"x-admin-password": owner_password},
+        )
+
+        self.assertEqual(attacker_response.status_code, 401)
+        self.assertEqual(owner_response.status_code, 200)
+        self.assertEqual(owner_response.json()["status"], "contactado")
 
 
 if __name__ == "__main__":

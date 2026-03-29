@@ -454,6 +454,29 @@ async def get_tenant_by_slug(slug: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+async def get_tenant_by_id(tenant_id: Any) -> Optional[Dict[str, Any]]:
+    if not tenant_id:
+        return None
+
+    tenant_object_id: Optional[ObjectId] = None
+    if isinstance(tenant_id, ObjectId):
+        tenant_object_id = tenant_id
+    elif isinstance(tenant_id, str) and ObjectId.is_valid(tenant_id):
+        tenant_object_id = ObjectId(tenant_id)
+
+    if tenant_object_id is None:
+        return None
+
+    tenant_doc = await db.tenants.find_one({"_id": tenant_object_id})
+    if tenant_doc:
+        tenant_doc["id"] = str(tenant_doc.pop("_id"))
+        logger.info("Tenant encontrado en Mongo por id=%s", tenant_doc["id"])
+        return tenant_doc
+
+    logger.debug("Tenant NO encontrado en Mongo por id=%s", tenant_id)
+    return None
+
+
 def build_public_business_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
     """
     Construye la configuración pública para el frontend desde un documento tenant.
@@ -510,6 +533,26 @@ def build_public_business_config_from_legacy(config: Dict[str, Any]) -> Dict[str
 
 def _chat_session_key(session_id: str, resolved_slug: str) -> str:
     return f"{resolved_slug}:{session_id}"
+
+
+def _build_lead_scope_filter(slug: str, tenant: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if tenant:
+        return {
+            "$or": [
+                {"tenant_id": tenant["id"]},
+                {"slug": slug, "tenant_id": None},
+                {"slug": slug, "tenant_id": {"$exists": False}},
+            ]
+        }
+    return {"slug": slug}
+
+
+async def _resolve_lead_owner_slug(lead_doc: Dict[str, Any]) -> Optional[str]:
+    tenant = await get_tenant_by_id(lead_doc.get("tenant_id"))
+    if tenant:
+        return tenant["slug"]
+    lead_slug = lead_doc.get("slug")
+    return normalize_slug(lead_slug) if lead_slug else None
 
 
 async def _resolve_chat_config(raw_slug: Optional[str]) -> Tuple[Dict[str, Any], str, Optional[str], str]:
@@ -715,7 +758,10 @@ async def get_leads(
     tenant = await get_tenant_by_slug(normalized_identifier)
     if tenant or normalized_identifier in CLIENT_CONFIGS:
         await verify_admin_password(normalized_identifier, x_admin_password, request=request)
-        leads = await db.leads.find({"slug": normalized_identifier}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+        leads = await db.leads.find(
+            _build_lead_scope_filter(normalized_identifier, tenant),
+            {"_id": 0},
+        ).sort("created_at", -1).to_list(1000)
         return leads
 
     if ObjectId.is_valid(identifier):
@@ -723,7 +769,8 @@ async def get_leads(
         lead_doc = await db.leads.find_one({"_id": ObjectId(identifier)})
         if not lead_doc:
             raise HTTPException(status_code=404, detail="Lead no encontrado")
-        await verify_admin_password(lead_doc.get("slug"), x_admin_password, request=request)
+        owner_slug = await _resolve_lead_owner_slug(lead_doc)
+        await verify_admin_password(owner_slug, x_admin_password, request=request)
         return serialize_lead(lead_doc)
 
     await verify_admin_password(normalized_identifier, x_admin_password, request=request)
@@ -744,7 +791,8 @@ async def list_leads(
     await verify_admin_password(normalized_slug, x_admin_password, request=request)
     filters: Dict[str, Any] = {}
     if normalized_slug:
-        filters["slug"] = normalized_slug
+        tenant = await get_tenant_by_slug(normalized_slug)
+        filters.update(_build_lead_scope_filter(normalized_slug, tenant))
     if status:
         filters["status"] = status.value
     if q:
@@ -784,7 +832,8 @@ async def update_lead(
     if not lead_doc:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
 
-    await verify_admin_password(lead_doc.get("slug"), x_admin_password, request=request)
+    owner_slug = await _resolve_lead_owner_slug(lead_doc)
+    await verify_admin_password(owner_slug, x_admin_password, request=request)
 
     update_fields: Dict[str, Any] = {}
     if payload.status is not None:

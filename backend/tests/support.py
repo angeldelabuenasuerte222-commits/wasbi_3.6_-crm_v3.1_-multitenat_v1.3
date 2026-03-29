@@ -45,11 +45,14 @@ class FakeCursor:
         return [copy.deepcopy(doc) for doc in self.docs[:length]]
 
 
-def _matches_condition(value, condition):
-    if isinstance(condition, dict) and "$regex" in condition:
-        pattern = condition["$regex"]
-        flags = re.IGNORECASE if "i" in condition.get("$options", "") else 0
-        return re.search(pattern, str(value or ""), flags) is not None
+def _matches_condition(value, condition, *, field_exists):
+    if isinstance(condition, dict):
+        if "$regex" in condition:
+            pattern = condition["$regex"]
+            flags = re.IGNORECASE if "i" in condition.get("$options", "") else 0
+            return re.search(pattern, str(value or ""), flags) is not None
+        if "$exists" in condition:
+            return field_exists is bool(condition["$exists"])
     return value == condition
 
 
@@ -60,7 +63,7 @@ def _matches_query(doc, query):
                 return False
             continue
 
-        if not _matches_condition(doc.get(key), condition):
+        if not _matches_condition(doc.get(key), condition, field_exists=(key in doc)):
             return False
     return True
 
