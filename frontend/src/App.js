@@ -6,7 +6,6 @@ import { motion, AnimatePresence } from "framer-motion";
 import { BrowserRouter, Routes, Route, useParams } from "react-router-dom";
 import { API } from "@/lib/api";
 import { normalizeSlug } from "@/lib/slug";
-import AdminDashboard from "./AdminDashboard";
 import CRMPage from "@/components/crm/CRMPage";
 import TenantsAdmin from "@/components/tenants/TenantsAdmin";
 
@@ -297,12 +296,17 @@ function ChatInterface() {
   );
 }
 
+function TenantCRMRoute() {
+  const { slug } = useParams();
+  return <CRMPage initialSlug={slug} lockSlug />;
+}
+
 export default function App() {
   return (
     <BrowserRouter>
       <Routes>
         <Route path="/crm" element={<CRMPage />} /> {/* Global CRM */}
-        <Route path="/crm/:slug" element={<AdminDashboard />} /> {/* Business-specific leads */}
+        <Route path="/crm/:slug" element={<TenantCRMRoute />} /> {/* Business-specific CRM */}
         <Route path="/internal/tenants" element={<TenantsAdmin />} /> {/* Panel interno multi-tenant */}
         <Route path="/:slug?" element={<ChatInterface />} />
       </Routes>

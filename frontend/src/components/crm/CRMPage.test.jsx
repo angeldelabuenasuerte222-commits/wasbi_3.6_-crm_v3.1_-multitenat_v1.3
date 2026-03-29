@@ -81,4 +81,21 @@ describe("CRMPage login validation", () => {
     expect(axios.get).toHaveBeenCalledWith(expect.stringContaining("/business/tenant-invalido"));
     expect(container.textContent).toContain("Acceso al CRM");
   });
+
+  it("locks the slug input and reuses the same login when rendered for /crm/:slug", async () => {
+    axios.get.mockResolvedValueOnce({ data: { business_name: "Cafe Minima" } });
+
+    await act(async () => {
+      root.render(<CRMPage initialSlug="cafe-minima" lockSlug />);
+      await flushPromises();
+      await flushPromises();
+    });
+
+    const slugInput = container.querySelector('input[placeholder="slug (ej. cafe-minima)"]');
+
+    expect(container.textContent).toContain("Acceso al CRM");
+    expect(container.textContent).toContain("cafe-minima");
+    expect(slugInput.disabled).toBe(true);
+    expect(axios.get).toHaveBeenCalledWith(expect.stringContaining("/business/cafe-minima"));
+  });
 });

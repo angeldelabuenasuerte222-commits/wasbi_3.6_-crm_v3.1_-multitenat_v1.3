@@ -132,4 +132,14 @@ describe("App routing error states", () => {
     expect(container.textContent).toContain("Slug no disponible");
     expect(axios.get).toHaveBeenCalledWith(expect.stringContaining("/business/slug-invalido"));
   });
+
+  it("reuses the shared CRM login flow for tenant-specific routes", async () => {
+    axios.get.mockResolvedValueOnce({ data: { business_name: "Cafe Minima" } });
+
+    await renderAtPath(root, "/crm/cafe-minima");
+
+    expect(container.textContent).toContain("Acceso al CRM");
+    expect(container.textContent).toContain("cafe-minima");
+    expect(axios.get).toHaveBeenCalledWith(expect.stringContaining("/business/cafe-minima"));
+  });
 });

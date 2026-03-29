@@ -75,17 +75,19 @@ const getRequestErrorMessage = (error, fallback) => {
   return getApiDetail(error) || fallback.defaultMessage;
 };
 
-export default function CRMPage() {
+export default function CRMPage({ initialSlug = "", lockSlug = false }) {
+  const normalizedInitialSlug = normalizeSlug(initialSlug);
   const [leads, setLeads] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [authError, setAuthError] = useState("");
   const [adminPassword, setAdminPassword] = useState("");
   const [passwordInput, setPasswordInput] = useState("");
-  const [slugInput, setSlugInput] = useState("");
+  const [slugInput, setSlugInput] = useState(normalizedInitialSlug);
   const [activeSlug, setActiveSlug] = useState("");
   const [slugError, setSlugError] = useState("");
   const [isSlugChecking, setIsSlugChecking] = useState(false);
+  const [isRouteSlugLoading, setIsRouteSlugLoading] = useState(Boolean(normalizedInitialSlug));
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [successMessage, setSuccessMessage] = useState("");
   const [searchText, setSearchText] = useState("");
@@ -136,8 +138,8 @@ export default function CRMPage() {
     setUpdating(false);
   }, [clearSuccessTimer]);
 
-  const validateSlugCandidate = async () => {
-    const normalized = normalizeSlug(slugInput);
+  const validateSlugCandidate = useCallback(async (candidateSlug) => {
+    const normalized = normalizeSlug(candidateSlug);
     if (!normalized) {
       setActiveSlug("");
       return "";
@@ -163,7 +165,43 @@ export default function CRMPage() {
     } finally {
       setIsSlugChecking(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    clearSuccessTimer();
+    setSlugInput(normalizedInitialSlug);
+    setActiveSlug("");
+    setSlugError("");
+    setAuthError("");
+    setAdminPassword("");
+    setPasswordInput("");
+    setSelectedLead(null);
+    setLeads([]);
+    setNotesDraft("");
+    setError("");
+    setSuccessMessage("");
+    setDetailLoading(false);
+    setUpdating(false);
+
+    if (!normalizedInitialSlug) {
+      setIsRouteSlugLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setIsRouteSlugLoading(true);
+
+    validateSlugCandidate(normalizedInitialSlug)
+      .finally(() => {
+        if (!cancelled) {
+          setIsRouteSlugLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [clearSuccessTimer, normalizedInitialSlug, validateSlugCandidate]);
 
   const loadLeads = useCallback(async () => {
     if (!adminPassword) {
@@ -238,7 +276,7 @@ export default function CRMPage() {
       return;
     }
     setIsAuthenticating(true);
-    const resolvedSlug = await validateSlugCandidate();
+    const resolvedSlug = await validateSlugCandidate(slugInput);
     if (resolvedSlug === null) {
       setIsAuthenticating(false);
       return;
@@ -360,6 +398,30 @@ export default function CRMPage() {
     };
   }, [clearSuccessTimer]);
 
+  if (lockSlug && isRouteSlugLoading) {
+    return (
+      <div className="min-h-screen bg-[#050505] flex items-center justify-center p-6 text-white">
+        <div className="max-w-md rounded-3xl border border-white/10 bg-[#0A0A0A] p-6 text-center">
+          Validando slug del CRM...
+        </div>
+      </div>
+    );
+  }
+
+  if (lockSlug && !adminPassword && slugError) {
+    return (
+      <div className="min-h-screen bg-[#050505] flex items-center justify-center p-6 text-white">
+        <div className="max-w-md rounded-3xl border border-red-500/30 bg-[#1A1A1A] p-6 text-center space-y-4">
+          <h2 className="text-2xl font-semibold">Slug no disponible</h2>
+          <p className="text-sm text-[#9CA3AF]">{slugError}</p>
+          <p className="text-xs text-[#9CA3AF]/80">
+            Revisa la ruta o usa la vista global en <span className="text-[#22C55E] font-semibold">/crm</span>.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   if (!adminPassword) {
     return (
       <div className="min-h-screen bg-[#050505] flex items-center justify-center px-4">
@@ -380,14 +442,19 @@ export default function CRMPage() {
                   setSlugInput(e.target.value);
                   setSlugError("");
                 }}
+                disabled={lockSlug}
                 className="mt-2 w-full rounded-2xl border border-white/10 bg-[#050505] px-4 py-3 focus:outline-none focus:border-[#22C55E]"
               />
               {slugError && (
                 <p className="mt-2 text-xs text-red-400">{slugError}</p>
               )}
-              {!slugInput && (
+              {lockSlug ? (
+                <p className="mt-2 text-xs text-[#9CA3AF]">
+                  Esta vista esta fijada al tenant <span className="text-[#22C55E] font-semibold">{normalizedInitialSlug}</span>.
+                </p>
+              ) : !slugInput && (
                 <p className="mt-2 text-xs text-yellow-300">
-                  Si dejas este campo vacío el CRM usará el modo legacy (contraseña global).
+                  Si dejas este campo vacio el CRM usara el modo legacy (contrasena global).
                 </p>
               )}
             </div>
