@@ -4,7 +4,7 @@ import re
 from datetime import datetime, timezone
 import sys # Import sys for SystemExit
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 import uvicorn
@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from bson import ObjectId
+from passlib.context import CryptContext
 
 # Setup Logging - Clean, Production Ready
 logging.basicConfig(
@@ -60,16 +61,187 @@ if not ADMIN_PASSWORD:
     logger.critical("Environment variable ADMIN_PASSWORD is not set. This is critical for CRM access security.")
     sys.exit("Error: ADMIN_PASSWORD environment variable is not set. Please set a strong password for CRM access.")
 
-def verify_admin_password(x_admin_password: Optional[str], password_query: Optional[str] = None):
-    provided = x_admin_password if x_admin_password is not None else password_query
-    if provided != ADMIN_PASSWORD:
+crypt_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+SLUG_PATTERN = re.compile(r"^[a-z0-9-]+$")
+
+
+def normalize_slug(value: str) -> str:
+    return value.strip().lower()
+
+
+def ensure_valid_slug(value: str) -> str:
+    normalized = normalize_slug(value)
+    if not normalized or not SLUG_PATTERN.match(normalized):
+        raise HTTPException(status_code=400, detail="El slug debe tener solo minúsculas, números y guiones.")
+    return normalized
+
+def _format_slug_for_log(slug: Optional[str]) -> str:
+    return slug if slug else "None"
+
+async def verify_tenant_admin_password(slug: Optional[str], provided_password: Optional[str]) -> None:
+    slug_tag = _format_slug_for_log(slug)
+    if not provided_password:
+        logger.info(
+            "tenant admin auth slug=%s source=LEGACY_GLOBAL result=FAILURE missing password",
+            slug_tag
+        )
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if slug:
+        tenant = await get_tenant_by_slug(slug)
+        if tenant:
+            admin_config = tenant.get("admin_config", {})
+            password_hash = admin_config.get("password_hash")
+            if password_hash:
+                if crypt_context.verify(provided_password, password_hash):
+                    logger.info(
+                        "tenant admin auth slug=%s source=MONGO result=SUCCESS",
+                        slug_tag
+                    )
+                    return
+                logger.info(
+                    "tenant admin auth slug=%s source=MONGO result=FAILURE invalid password",
+                    slug_tag
+                )
+                raise HTTPException(status_code=401, detail="Unauthorized")
+            logger.info(
+                "tenant admin auth slug=%s source=NOT_FOUND result=FAILURE missing admin_config",
+                slug_tag
+            )
+        else:
+            logger.info(
+                "tenant admin auth slug=%s source=NOT_FOUND result=FAILURE missing tenant",
+                slug_tag
+            )
+
+    if provided_password == ADMIN_PASSWORD:
+        logger.info(
+            "tenant admin auth slug=%s source=LEGACY_GLOBAL result=SUCCESS",
+            slug_tag
+        )
+        return
+
+    logger.info(
+        "tenant admin auth slug=%s source=LEGACY_GLOBAL result=FAILURE invalid global password",
+        slug_tag
+    )
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def verify_admin_password(
+    slug: Optional[str],
+    x_admin_password: Optional[str],
+    password_query: Optional[str] = None
+) -> None:
+    provided = x_admin_password if x_admin_password is not None else password_query
+    await verify_tenant_admin_password(slug, provided)
+
+
+async def ensure_internal_admin(x_admin_password: Optional[str]) -> None:
+    if not x_admin_password:
+        raise HTTPException(status_code=401, detail="Cabecera x-admin-password requerida.")
+    await verify_admin_password(None, x_admin_password)
 
 # MongoDB connection
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
+
+async def ensure_mongo_indexes() -> None:
+    """
+    Asegura índices útiles para la estrategia multi-tenant sin romper documentos legacy.
+    """
+    try:
+        tenant_idx = await db.tenants.create_index(
+            "slug",
+            unique=True,
+            name="tenant_slug_unique",
+            background=True,
+            partialFilterExpression={"slug": {"$exists": True}}
+        )
+        logger.info("Índice creado tenants.slug unique=%s", tenant_idx)
+    except Exception as exc:
+        logger.warning("No se pudo crear índice tenants.slug único: %s", exc)
+
+    index_defs = [
+        {
+            "keys": [("tenant_id", 1)],
+            "name": "leads_tenant_id",
+            "partialFilterExpression": {"tenant_id": {"$exists": True}},
+        },
+        {
+            "keys": [("slug", 1)],
+            "name": "leads_slug",
+            "partialFilterExpression": {"slug": {"$exists": True}},
+        },
+        {
+            "keys": [("tenant_id", 1), ("created_at", -1)],
+            "name": "leads_tenant_created",
+            "partialFilterExpression": {"tenant_id": {"$exists": True}},
+        },
+        {
+            "keys": [("created_at", -1)],
+            "name": "leads_created_at",
+        },
+    ]
+
+    for index in index_defs:
+        try:
+            idx_name = await db.leads.create_index(
+                index["keys"],
+                name=index["name"],
+                background=True,
+                partialFilterExpression=index.get("partialFilterExpression"),
+            )
+            logger.info("Índice creado leads.%s (%s)", index["name"], idx_name)
+        except Exception as exc:
+            logger.warning("Fallo al crear índice leads.%s : %s", index["name"], exc)
+
+# =============================================================================
+# MULTI-TENANT SUPPORT (MIGRACIÓN INCREMENTAL)
+# =============================================================================
+
+async def get_tenant_by_slug(slug: str) -> Optional[Dict[str, Any]]:
+    """
+    Busca un tenant en la colección 'tenants' por slug.
+    Retorna None si no existe.
+    """
+    if not slug:
+        return None
+    
+    tenant_doc = await db.tenants.find_one({"slug": slug})
+    if tenant_doc:
+        tenant_doc["id"] = str(tenant_doc.pop("_id"))
+        logger.info("Tenant encontrado en Mongo: slug=%s", slug)
+        return tenant_doc
+    
+    logger.debug("Tenant NO encontrado en Mongo: slug=%s (usando fallback)", slug)
+    return None
+
+
+def build_public_business_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Construye la configuración pública para el frontend desde un documento tenant.
+    Solo expone campos seguros para el cliente.
+    """
+    return {
+        "business_name": tenant.get("business_name", "Negocio"),
+        "phone": tenant.get("phone", ""),
+        "hours": tenant.get("hours", ""),
+        "address": tenant.get("address", ""),
+        "avatar": tenant.get("avatar", ""),
+        "image": tenant.get("image", ""),
+        "greeting": tenant.get("greeting", "Hola, ¿en qué puedo ayudarte?"),
+        "_source": "mongo"  # Flag para debugging
+    }
+
 app = FastAPI(title="WHASABI API")
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    logger.info("Inicializando índices de MongoDB...")
+    await ensure_mongo_indexes()
+
 api_router = APIRouter(prefix="/api")
 
 # Global Exception Handler
@@ -118,6 +290,44 @@ CLIENT_CONFIGS = {
     }
 }
 
+DEFAULT_SLUG = "default"
+DEMO_SLUGS = {DEFAULT_SLUG}
+
+
+def _build_chat_config_from_tenant(tenant: Dict[str, Any]) -> Dict[str, Any]:
+    config = build_public_business_config(tenant)
+    config["system_prompt"] = tenant.get("system_prompt", "")
+    return config
+
+
+async def _resolve_chat_config(raw_slug: Optional[str]) -> Tuple[Dict[str, Any], str, Optional[str], str]:
+    slug = raw_slug.strip() if raw_slug else ""
+    if slug:
+        tenant = await get_tenant_by_slug(slug)
+        if tenant:
+            config = _build_chat_config_from_tenant(tenant)
+            logger.info("Chat config: slug=%s source=MONGO", slug)
+            return config, slug, tenant["id"], "MONGO"
+
+        if slug in DEMO_SLUGS:
+            logger.info("Chat config: slug=%s source=DEFAULT_ONLY_WHEN_ALLOWED", slug)
+            default_config = dict(CLIENT_CONFIGS[DEFAULT_SLUG])
+            default_config["_source"] = "default_only_when_allowed"
+            return default_config, DEFAULT_SLUG, None, "DEFAULT_ONLY_WHEN_ALLOWED"
+
+        legacy_config = CLIENT_CONFIGS.get(slug)
+        if legacy_config:
+            logger.info("Chat config: slug=%s source=LEGACY_FALLBACK", slug)
+            return {**legacy_config, "_source": "legacy_fallback"}, slug, None, "LEGACY_FALLBACK"
+
+        logger.info("Chat config: slug=%s source=NOT_FOUND", slug)
+        raise HTTPException(status_code=404, detail="Configuración de chat no encontrada para el slug solicitado.")
+
+    logger.info("Chat config: slug=%s source=DEFAULT_ONLY_WHEN_ALLOWED", "<empty>")
+    default_config = dict(CLIENT_CONFIGS[DEFAULT_SLUG])
+    default_config["_source"] = "default_only_when_allowed"
+    return default_config, DEFAULT_SLUG, None, "DEFAULT_ONLY_WHEN_ALLOWED"
+
 NAME_PATTERNS = [
     re.compile(r"(?:me llamo|mi nombre es|soy)\s+([^\W\d_]+(?:\s+[^\W\d_]+){0,3})", re.IGNORECASE),
 ]
@@ -161,11 +371,55 @@ class LeadUpdate(BaseModel):
     notes: Optional[str] = Field(None, description="Notas internas sobre el lead")
 
 
+class TenantCreate(BaseModel):
+    slug: str = Field(..., description="Identificador único del tenant")
+    business_name: str = Field(..., min_length=1)
+    phone: str = Field("", description="Teléfono visible del negocio")
+    hours: str = Field("", description="Horarios del negocio")
+    address: str = Field("", description="Dirección del negocio")
+    avatar: str = Field("", description="URL de avatar")
+    image: str = Field("", description="URL de imagen de portada")
+    greeting: str = Field("", description="Saludo inicial del asistente")
+    admin_password: str = Field(..., min_length=8, description="Contraseña para admin")
+    is_active: bool = Field(True, description="Si el tenant está activo")
+
+
+class TenantUpdate(BaseModel):
+    business_name: Optional[str] = Field(None, description="Nombre del negocio")
+    phone: Optional[str] = Field(None)
+    hours: Optional[str] = Field(None)
+    address: Optional[str] = Field(None)
+    avatar: Optional[str] = Field(None)
+    image: Optional[str] = Field(None)
+    greeting: Optional[str] = Field(None)
+    admin_password: Optional[str] = Field(None, min_length=8)
+    is_active: Optional[bool] = Field(None, description="Activa/desactiva tenant")
+
+
 def serialize_lead(doc: Dict[str, Any]) -> Dict[str, Any]:
     lead = doc.copy()
     lead["id"] = str(lead.get("_id"))
     lead.pop("_id", None)
     return lead
+
+
+def tenant_public(doc: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": str(doc.get("_id")),
+        "slug": doc.get("slug"),
+        "business_name": doc.get("business_name"),
+        "phone": doc.get("phone"),
+        "hours": doc.get("hours"),
+        "address": doc.get("address"),
+        "avatar": doc.get("avatar"),
+        "image": doc.get("image"),
+        "greeting": doc.get("greeting"),
+        "is_active": doc.get("is_active", True),
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+        "has_password": bool(doc.get("admin_config", {}).get("password_hash")),
+    }
+
 
 @api_router.get("/health")
 async def health_check(): # Added "service" for consistency with test results
@@ -173,8 +427,28 @@ async def health_check(): # Added "service" for consistency with test results
 
 @api_router.get("/business/{slug}")
 async def get_business(slug: str):
-    config = CLIENT_CONFIGS.get(slug, CLIENT_CONFIGS["default"])
-    return config
+    """
+    Obtiene configuración del negocio.
+    ESTRATEGIA DE MIGRACIÓN:
+    1. Intenta buscar en Mongo (colección 'tenants')
+    2. Si no existe, usa fallback a CLIENT_CONFIGS (legacy)
+    3. Si tampoco está en legacy, responde con 404
+    """
+    # --- INTENTO 1: Buscar en MongoDB (NUEVO) ---
+    tenant = await get_tenant_by_slug(slug)
+    if tenant:
+        config = build_public_business_config(tenant)
+        logger.info("Business config: slug=%s source=MONGO", slug)
+        return config
+    
+    # --- INTENTO 2: Fallback a CLIENT_CONFIGS (LEGACY - TEMPORAL) ---
+    legacy_config = CLIENT_CONFIGS.get(slug)
+    if legacy_config:
+        logger.info("Business config: slug=%s source=LEGACY_FALLBACK", slug)
+        return {**legacy_config, "_source": "legacy_fallback"}
+
+    logger.info("Business config: slug=%s source=NOT_FOUND", slug)
+    raise HTTPException(status_code=404, detail="Configuración no encontrada para ese negocio")
 
 @api_router.get("/leads/{identifier}")
 async def get_leads(
@@ -182,15 +456,15 @@ async def get_leads(
     password: Optional[str] = None,
     x_admin_password: Optional[str] = Header(None)
 ):
-    verify_admin_password(x_admin_password, password)
-
     if ObjectId.is_valid(identifier) and password is None:
         logger.info("Read lead id=%s", identifier)
         lead_doc = await db.leads.find_one({"_id": ObjectId(identifier)})
         if not lead_doc:
             raise HTTPException(status_code=404, detail="Lead no encontrado")
+        await verify_admin_password(lead_doc.get("slug"), x_admin_password, password)
         return serialize_lead(lead_doc)
 
+    await verify_admin_password(identifier, x_admin_password, password)
     leads = await db.leads.find({"slug": identifier}, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return leads
 
@@ -203,7 +477,7 @@ async def list_leads(
     limit: int = 200,
     x_admin_password: Optional[str] = Header(None)
 ):
-    verify_admin_password(x_admin_password)
+    await verify_admin_password(slug, x_admin_password)
     filters: Dict[str, Any] = {}
     if slug:
         filters["slug"] = slug
@@ -234,11 +508,16 @@ async def update_lead(
     payload: LeadUpdate,
     x_admin_password: Optional[str] = Header(None)
 ):
-    verify_admin_password(x_admin_password)
     try:
         oid = ObjectId(lead_id)
     except Exception:
         raise HTTPException(status_code=400, detail="ID inválido")
+
+    lead_doc = await db.leads.find_one({"_id": oid})
+    if not lead_doc:
+        raise HTTPException(status_code=404, detail="Lead no encontrado")
+
+    await verify_admin_password(lead_doc.get("slug"), x_admin_password)
 
     update_fields: Dict[str, Any] = {}
     if payload.status is not None:
@@ -257,27 +536,127 @@ async def update_lead(
     updated_doc = await db.leads.find_one({"_id": oid})
     return serialize_lead(updated_doc)
 
+
+@api_router.get("/internal/tenants")
+async def list_internal_tenants(x_admin_password: Optional[str] = Header(None)):
+    await ensure_internal_admin(x_admin_password)
+    cursor = db.tenants.find().sort("created_at", -1)
+    docs = await cursor.to_list(length=500)
+    return [tenant_public(doc) for doc in docs]
+
+
+@api_router.post("/internal/tenants")
+async def create_internal_tenant(
+    payload: TenantCreate,
+    x_admin_password: Optional[str] = Header(None)
+):
+    await ensure_internal_admin(x_admin_password)
+    slug = ensure_valid_slug(payload.slug)
+    if await db.tenants.find_one({"slug": slug}):
+        raise HTTPException(status_code=400, detail="El slug ya existe.")
+    now = datetime.now(timezone.utc).isoformat()
+    tenant_doc = {
+        "slug": slug,
+        "business_name": payload.business_name.strip(),
+        "phone": payload.phone.strip(),
+        "hours": payload.hours.strip(),
+        "address": payload.address.strip(),
+        "avatar": payload.avatar.strip(),
+        "image": payload.image.strip(),
+        "greeting": payload.greeting.strip(),
+        "is_active": payload.is_active,
+        "admin_config": {"password_hash": crypt_context.hash(payload.admin_password)},
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.tenants.insert_one(tenant_doc)
+    created = await db.tenants.find_one({"slug": slug})
+    return tenant_public(created)
+
+
+@api_router.get("/internal/tenants/{slug}")
+async def get_internal_tenant(slug: str, x_admin_password: Optional[str] = Header(None)):
+    await ensure_internal_admin(x_admin_password)
+    normalized_slug = ensure_valid_slug(slug)
+    tenant_doc = await db.tenants.find_one({"slug": normalized_slug})
+    if not tenant_doc:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    return tenant_public(tenant_doc)
+
+
+@api_router.patch("/internal/tenants/{slug}")
+async def update_internal_tenant(
+    slug: str,
+    payload: TenantUpdate,
+    x_admin_password: Optional[str] = Header(None)
+):
+    await ensure_internal_admin(x_admin_password)
+    normalized_slug = ensure_valid_slug(slug)
+    existing = await db.tenants.find_one({"slug": normalized_slug})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Tenant no encontrado.")
+    update_fields: Dict[str, Any] = {}
+
+    def _set_field(field_name: str, value: Optional[str]) -> None:
+        if value is not None:
+            update_fields[field_name] = value.strip()
+
+    _set_field("business_name", payload.business_name)
+    _set_field("phone", payload.phone)
+    _set_field("hours", payload.hours)
+    _set_field("address", payload.address)
+    _set_field("avatar", payload.avatar)
+    _set_field("image", payload.image)
+    _set_field("greeting", payload.greeting)
+
+    if payload.admin_password:
+        update_fields["admin_config.password_hash"] = crypt_context.hash(payload.admin_password)
+
+    if payload.is_active is not None:
+        update_fields["is_active"] = payload.is_active
+
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="No se proporcionaron campos para actualizar.")
+
+    update_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.tenants.update_one({"slug": normalized_slug}, {"$set": update_fields})
+    updated = await db.tenants.find_one({"slug": normalized_slug})
+    return tenant_public(updated)
+
 @api_router.post("/chat")
 async def handle_chat(message: ChatMessage):
     session_id = message.session_id
     text = message.text.strip()
     lower_text = text.lower()
-    
-    slug = message.slug if message.slug and message.slug in CLIENT_CONFIGS else "default"
-    config = CLIENT_CONFIGS[slug]
-    
+
+    # ESTRATEGIA DE MIGRACIÓN: Primero Mongo, luego fallback a legacy
+    config, resolved_slug, resolved_tenant_id, config_source = await _resolve_chat_config(message.slug)
+    logger.info(
+        "Session association session_id=%s slug=%s tenant_id=%s source=%s",
+        session_id,
+        resolved_slug,
+        resolved_tenant_id or "legacy",
+        config_source,
+    )
+
     # Initialize session state if not exists
     if session_id not in chat_sessions:
         chat_sessions[session_id] = {
             "messages": [{"role": "system", "content": config["system_prompt"]}],
             "nombre": None,
             "telefono": None,
+
             "consulta": None,
             "leadSaved": False,
-            "slug": slug
+            "slug": resolved_slug,
+            "tenant_id": resolved_tenant_id,
+            "tenant_source": config_source,
         }
     
     state = chat_sessions[session_id]
+    state["slug"] = resolved_slug
+    state["tenant_id"] = resolved_tenant_id
+    state["tenant_source"] = config_source
     state["messages"].append({"role": "user", "content": text})
     
     # --- LEAD EXTRACTION LOGIC ---
@@ -318,6 +697,7 @@ async def handle_chat(message: ChatMessage):
     if state["nombre"] and state["telefono"] and state["consulta"] and not state["leadSaved"]:
         lead_doc = {
             "slug": state["slug"],
+            "tenant_id": state.get("tenant_id"),
             "nombre": state["nombre"],
             "telefono": state["telefono"],
             "consulta": state["consulta"],
@@ -329,10 +709,21 @@ async def handle_chat(message: ChatMessage):
         if notes is not None:
             lead_doc["notes"] = notes
         try:
-            logger.info("Lead insert attempt session_id=%s collection=leads", session_id)
+            logger.info(
+                "Lead insert attempt session_id=%s slug=%s tenant_id=%s source=%s collection=leads",
+                session_id,
+                lead_doc["slug"],
+                lead_doc.get("tenant_id") or "legacy",
+                state.get("tenant_source", "legacy"),
+            )
             result = await db.leads.insert_one(lead_doc)
             state["leadSaved"] = True
-            logger.info("Lead insert success session_id=%s inserted_id=%s", session_id, result.inserted_id)
+            logger.info(
+                "Lead insert success session_id=%s tenant_id=%s inserted_id=%s",
+                session_id,
+                lead_doc.get("tenant_id") or "legacy",
+                result.inserted_id,
+            )
         except Exception:
             logger.exception("Lead insert error session_id=%s", session_id)
 

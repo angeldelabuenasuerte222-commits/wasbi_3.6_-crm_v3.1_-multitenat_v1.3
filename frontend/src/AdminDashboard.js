@@ -4,14 +4,32 @@ import { useParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import { User, Phone, MessageSquare, Clock } from "lucide-react";
 import { API } from "@/lib/api";
+import { normalizeSlug } from "@/lib/slug";
 
 export default function AdminDashboard() {
-  const { slug } = useParams();
+  const { slug: rawSlug } = useParams();
+  const slug = normalizeSlug(rawSlug);
   const [password, setPassword] = useState("");
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [leads, setLeads] = useState([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  if (!slug) {
+    return (
+      <div className="min-h-screen bg-[#050505] flex items-center justify-center p-6 text-white">
+        <div className="max-w-md bg-[#1A1A1A] border border-white/10 rounded-3xl p-6 text-center space-y-4">
+          <h2 className="text-2xl font-semibold">Slug requerido</h2>
+          <p className="text-sm text-[#9CA3AF]">
+            La ruta del CRM para tenants necesita un slug válido (ej. <span className="text-[#22C55E] font-medium">/crm/cafe-minima</span>).
+          </p>
+          <p className="text-xs text-[#9CA3AF]/80">
+            Mantén la compatibilidad legacy usando la vista global en <span className="text-[#22C55E] font-semibold">/crm</span>.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   const handleLogin = async (e) => {
     e.preventDefault();

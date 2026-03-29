@@ -207,6 +207,7 @@ function ChatInterface() {
 
 import AdminDashboard from "./AdminDashboard";
 import CRMPage from "@/components/crm/CRMPage";
+import TenantsAdmin from "@/components/tenants/TenantsAdmin";
 
 export default function App() {
   return (
@@ -214,6 +215,7 @@ export default function App() {
       <Routes>
         <Route path="/crm" element={<CRMPage />} /> {/* Global CRM */}
         <Route path="/crm/:slug" element={<AdminDashboard />} /> {/* Business-specific leads */}
+        <Route path="/internal/tenants" element={<TenantsAdmin />} /> {/* Panel interno multi-tenant */}
         <Route path="/:slug?" element={<ChatInterface />} />
       </Routes>
     </BrowserRouter>

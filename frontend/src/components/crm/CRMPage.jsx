@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import axios from "axios";
 import { API } from "@/lib/api";
+import { normalizeSlug } from "@/lib/slug";
 
 const FILTER_STATUS_OPTIONS = [
   { value: "", label: "Todos" },
@@ -47,6 +48,11 @@ export default function CRMPage() {
   const [authError, setAuthError] = useState("");
   const [adminPassword, setAdminPassword] = useState("");
   const [passwordInput, setPasswordInput] = useState("");
+  const [slugInput, setSlugInput] = useState("");
+  const [activeSlug, setActiveSlug] = useState("");
+  const [slugError, setSlugError] = useState("");
+  const [isSlugChecking, setIsSlugChecking] = useState(false);
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [successMessage, setSuccessMessage] = useState("");
   const [searchText, setSearchText] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
@@ -71,6 +77,30 @@ export default function CRMPage() {
     setUpdating(false);
   };
 
+  const validateSlugCandidate = async () => {
+    const normalized = normalizeSlug(slugInput);
+    if (!normalized) {
+      setActiveSlug("");
+      return "";
+    }
+    setSlugError("");
+    setIsSlugChecking(true);
+    try {
+      await axios.get(`${API}/business/${normalized}`);
+      setActiveSlug(normalized);
+      return normalized;
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        setSlugError(`No existe un tenant con el slug "${normalized}".`);
+      } else {
+        setSlugError("No fue posible validar el slug en este momento.");
+      }
+      return null;
+    } finally {
+      setIsSlugChecking(false);
+    }
+  };
+
   const loadLeads = async () => {
     if (!adminPassword) {
       return;
@@ -79,7 +109,10 @@ export default function CRMPage() {
     setError("");
     setAuthError("");
     try {
+      const slugParam = activeSlug || undefined;
+      // La lista de leads requiere el slug del tenant; el resto de endpoints usan el slug que ya viene en cada lead.
       const params = {
+        slug: slugParam,
         q: searchQuery || undefined,
         status: statusFilter || undefined,
         limit: 200,
@@ -104,7 +137,7 @@ export default function CRMPage() {
   useEffect(() => {
     if (!adminPassword) return;
     loadLeads();
-  }, [adminPassword, searchQuery, statusFilter, refreshKey]);
+  }, [adminPassword, searchQuery, statusFilter, refreshKey, activeSlug]);
 
   const handleSearch = () => {
     setSearchQuery(searchText.trim());
@@ -114,15 +147,23 @@ export default function CRMPage() {
     setRefreshKey((prev) => prev + 1);
   };
 
-  const handlePasswordSubmit = (event) => {
+  const handlePasswordSubmit = async (event) => {
     event.preventDefault();
     setAuthError("");
+    setSlugError("");
     const trimmed = passwordInput.trim();
     if (!trimmed) {
       setAuthError("Ingresa la contraseña para continuar.");
       return;
     }
+    setIsAuthenticating(true);
+    const resolvedSlug = await validateSlugCandidate();
+    if (resolvedSlug === null) {
+      setIsAuthenticating(false);
+      return;
+    }
     setAdminPassword(trimmed);
+    setIsAuthenticating(false);
   };
 
   const handleLogout = () => {
@@ -137,6 +178,7 @@ export default function CRMPage() {
     setDetailLoading(true);
     setError("");
     try {
+      // La solicitud a /leads/:id usa el slug que ya está guardado en el lead.
       const { data } = await axios.get(`${API}/leads/${lead.id}`, {
         headers: getAuthHeaders(),
       });
@@ -159,6 +201,7 @@ export default function CRMPage() {
     setUpdating(true);
     setError("");
     try {
+      // PATCH del lead se valida con el slug que ya está almacenado en el documento.
       await axios.patch(
         `${API}/leads/${selectedLead.id}`,
         {
@@ -187,6 +230,7 @@ export default function CRMPage() {
     setUpdating(true);
     setError("");
     try {
+      // Las notas también comparten la autenticación basada en el slug del lead.
       await axios.patch(
         `${API}/leads/${selectedLead.id}`,
         {
@@ -237,6 +281,27 @@ export default function CRMPage() {
             en tu backend para acceder. No hay contraseña por defecto.
           </p>
           <form onSubmit={handlePasswordSubmit} className="mt-5 space-y-4">
+            <div>
+              <label className="text-xs uppercase tracking-wider text-[#9CA3AF]">Slug del tenant</label>
+              <input
+                type="text"
+                placeholder="slug (ej. cafe-minima)"
+                value={slugInput}
+                onChange={(e) => {
+                  setSlugInput(e.target.value);
+                  setSlugError("");
+                }}
+                className="mt-2 w-full rounded-2xl border border-white/10 bg-[#050505] px-4 py-3 focus:outline-none focus:border-[#22C55E]"
+              />
+              {slugError && (
+                <p className="mt-2 text-xs text-red-400">{slugError}</p>
+              )}
+              {!slugInput && (
+                <p className="mt-2 text-xs text-yellow-300">
+                  Si dejas este campo vacío el CRM usará el modo legacy (contraseña global).
+                </p>
+              )}
+            </div>
             <input
               type="password"
               placeholder="Contraseña"
@@ -246,9 +311,10 @@ export default function CRMPage() {
             />
             <button
               type="submit"
-              className="w-full rounded-2xl bg-[#22C55E] py-3 text-sm font-semibold text-black transition hover:bg-[#16A34A]"
+              disabled={isAuthenticating || isSlugChecking || !passwordInput.trim()}
+              className="w-full rounded-2xl bg-[#22C55E] py-3 text-sm font-semibold text-black transition hover:bg-[#16A34A] disabled:opacity-50"
             >
-              Entrar al CRM
+              {isAuthenticating || isSlugChecking ? "Validando..." : "Entrar al CRM"}
             </button>
           </form>
           {authError && (
@@ -265,6 +331,12 @@ export default function CRMPage() {
         <div>
           <p className="text-sm text-[#9CA3AF]">CRM interno</p>
           <h1 className="text-3xl font-semibold text-white">Gestión de leads</h1>
+          <p className="text-xs text-[#9CA3AF]/80 mt-1 max-w-xl">
+            <span className="font-semibold text-[#22C55E]">{activeSlug || "Modo legacy (sin slug)"}</span>
+            <span className="block text-[11px]">
+              Lista de leads y filtros usan ese slug; detalles, notas y estados confían en el slug almacenado en cada lead.
+            </span>
+          </p>
         </div>
         <div className="flex flex-wrap gap-3">
           <button
